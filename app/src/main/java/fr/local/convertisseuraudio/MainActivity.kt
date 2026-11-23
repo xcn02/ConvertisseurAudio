@@ -63,7 +63,7 @@ class MainActivity : Activity() {
         setText(value); setSingleLine(true); setSelectAllOnFocus(true); this.hint = hint
     }
     private fun screen(title: String, subtitle: String? = null) {
-        val scroll = ScrollView(this).apply { fillViewport = true }
+        val scroll = ScrollView(this).apply { isFillViewport = true }
         root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(22), dp(22), dp(22), dp(30)) }
         scroll.addView(root)
         setContentView(scroll)
