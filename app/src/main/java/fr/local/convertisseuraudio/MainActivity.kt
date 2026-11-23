@@ -84,7 +84,6 @@ class MainActivity : Activity() {
                 if (lastVolumeDownMs != 0L && now - lastVolumeDownMs <= volumeDoublePressWindowMs) {
                     lastVolumeDownMs = 0L
                     sendAction(RecorderService.ACTION_STOP)
-                    Toast.makeText(this, "Arrêt demandé : sauvegarde de l'audio", Toast.LENGTH_SHORT).show()
                 } else {
                     lastVolumeDownMs = now
                 }
@@ -212,7 +211,7 @@ class MainActivity : Activity() {
         heading("Application")
         root.addView(text("Stockage local uniquement. Pas de connexion réseau, compte ou suivi publicitaire."))
         root.addView(text("Les indicateurs et notifications d'enregistrement d'Android restent actifs."))
-        root.addView(text("Version 0.5.0 • Projet de développement", 13f))
+        root.addView(text("Version 0.5.2 • Projet de développement", 13f))
     }
     private fun showAudio() {
         page = "audio"; screen("Enregistreur audio", "La capture est signalée par Android et la notification de l'application.")
@@ -285,3 +284,71 @@ class MainActivity : Activity() {
         }
         root.addView(text("Les nouveaux paramètres prennent effet à la prochaine session.", 13f))
     }
+    private fun updateRecorderControls() {
+        val state = RecorderService.state
+        status?.text = when (state) {
+            "recording" -> "● Enregistrement : ${RecorderService.seconds} s"
+            "paused" -> "Ⅱ En pause : ${RecorderService.seconds} s"
+            else -> "Prêt à enregistrer"
+        }
+        startButton?.isEnabled = state == "idle"
+        pauseButton?.isEnabled = state != "idle"
+        pauseButton?.text = if (state == "paused") "Reprendre" else "Pause"
+    }
+    private fun startRecording() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 17)
+        } else {
+            sendAction(RecorderService.ACTION_START)
+            Handler(Looper.getMainLooper()).postDelayed({ updateRecorderControls() }, 600)
+        }
+    }
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 17 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) startRecording()
+    }
+    private fun sendAction(action: String) {
+        val intent = Intent(this, RecorderService::class.java).setAction(action)
+        if (action == RecorderService.ACTION_START) startForegroundService(intent) else startService(intent)
+    }
+    private fun showFiles() {
+        page = "files"; screen("Enregistrements", "Fichiers M4A stockés uniquement sur cet appareil")
+        root.addView(button("← Enregistreur") { showAudio() })
+        val files = RecorderService.folder(this).listFiles()?.filter { it.extension == "m4a" }?.sortedByDescending { it.lastModified() } ?: emptyList()
+        if (files.isEmpty()) { root.addView(text("Aucun fichier enregistré.")); return }
+        files.forEach { file ->
+            heading(file.nameWithoutExtension.replace('_', ' '))
+            root.addView(text("${file.length() / 1024L} Ko", 13f))
+            root.addView(button("▶ Écouter / arrêter") {
+                player?.release(); player = null
+                try {
+                    player = MediaPlayer().apply { setDataSource(file.absolutePath); prepare(); start(); setOnCompletionListener { it.release(); player = null } }
+                } catch (e: Exception) { Toast.makeText(this, "Lecture impossible", Toast.LENGTH_SHORT).show() }
+            })
+            root.addView(button("Partager le fichier") {
+                // No FileProvider dependency: use document export through ACTION_CREATE_DOCUMENT.
+                pendingExport = file
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "audio/mp4"; putExtra(Intent.EXTRA_TITLE, file.name) }
+                @Suppress("DEPRECATION") startActivityForResult(intent, 101)
+            })
+            root.addView(button("Supprimer") {
+                android.app.AlertDialog.Builder(this).setTitle("Supprimer ce fichier ?")
+                    .setMessage(file.name).setNegativeButton("Annuler", null)
+                    .setPositiveButton("Supprimer") { _, _ -> if (file.delete()) showFiles() else Toast.makeText(this, "Suppression impossible", Toast.LENGTH_SHORT).show() }.show()
+            })
+        }
+    }
+    private var pendingExport: File? = null
+    @Deprecated("Document export result")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 101 && resultCode == RESULT_OK) {
+            val src = pendingExport; val uri = data?.data
+            if (src != null && uri != null) {
+                try { contentResolver.openOutputStream(uri)?.use { out -> src.inputStream().use { it.copyTo(out) } }; Toast.makeText(this, "Fichier exporté", Toast.LENGTH_SHORT).show() }
+                catch (_: Exception) { Toast.makeText(this, "Échec de l'export", Toast.LENGTH_SHORT).show() }
+            }
+            pendingExport = null
+        }
+    }
+}

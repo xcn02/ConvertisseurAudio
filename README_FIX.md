@@ -1,0 +1,1 @@
+V0.5.2 : restauration des fonctions Kotlin manquantes et accolade de fermeture de MainActivity. Double appui Volume - : arrêt et sauvegarde sans dialogue de confirmation ni toast, seulement lorsque l’écran Enregistreur est visible. La notification du service de premier plan reste obligatoire sur Android pendant l’enregistrement. Compilation Android non exécutée.
