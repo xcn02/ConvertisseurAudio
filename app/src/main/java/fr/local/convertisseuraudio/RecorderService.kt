@@ -19,6 +19,7 @@ class RecorderService : Service() {
         const val EXTRA_STATE = "state"
         @Volatile var state = "idle"
         @Volatile var seconds = 0L
+        @Volatile var amplitude = 0
         const val CHANNEL_ID = "audio_recording"
         const val NOTIF_ID = 1024
         fun folder(context: Context): File = File(context.filesDir, "audio").apply { mkdirs() }
@@ -42,8 +43,9 @@ class RecorderService : Service() {
                     (accumulated + if (state == "recording") SystemClock.elapsedRealtime() - segmentStart else 0L) / 1000L
                 }
                 if (limitSeconds > 0L && seconds >= limitSeconds) { stopRecording(); return }
+                amplitude = if (state == "recording") (recorder?.runCatching { maxAmplitude }?.getOrNull() ?: 0) else 0
                 broadcastState()
-                handler.postDelayed(this, 500)
+                handler.postDelayed(this, 180)
             }
         }
     }
@@ -148,7 +150,7 @@ class RecorderService : Service() {
         try { current?.stop() } catch (_: RuntimeException) { valid = false }
         finally { current?.runCatching { release() } }
         if (!valid) target?.delete()
-        state = "idle"; seconds = 0L
+        state = "idle"; seconds = 0L; amplitude = 0
         broadcastState(if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
