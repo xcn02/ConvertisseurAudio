@@ -376,7 +376,7 @@ class MainActivity : Activity() {
         }
         uiHandler.post(object : Runnable { override fun run() {
             if (player !== media || page != "player") return
-            val current = media.currentPosition; time.text = formatTime(current) + " / " + formatTime(duration.toLong()); seek.progress = current; wave.position(current); uiHandler.postDelayed(this, 40)
+            val current = media.currentPosition; time.text = formatTime(current.toLong()) + " / " + formatTime(duration.toLong()); seek.progress = current; wave.position(current); uiHandler.postDelayed(this, 40)
         } })
     }
     private var pendingExport: AudioStorage.Recording? = null
