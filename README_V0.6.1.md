@@ -1,0 +1,2 @@
+# Version 0.6.1
+Android 10+ : écriture directe via MediaStore dans Music/Convertisseur/Recordings/ ; publication à la finalisation. Aucun original privé ni duplication automatique pour les nouveaux enregistrements. Android 8–9 : stockage privé et export manuel conservés. Les anciens fichiers privés restent lisibles ; les anciennes copies exportées ne sont pas effacées automatiquement. Les fichiers partagés ne sont pas cachés. Notification audio et commandes existantes conservées. Compilation Android non effectuée.

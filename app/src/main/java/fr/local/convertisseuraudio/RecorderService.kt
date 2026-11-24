@@ -20,12 +20,16 @@ class RecorderService : Service() {
         @Volatile var state = "idle"
         @Volatile var seconds = 0L
         @Volatile var amplitude = 0
+        val peaks = ArrayList<Int>()
+        @Volatile var recordedMs = 0L
         const val CHANNEL_ID = "audio_recording"
         const val NOTIF_ID = 1024
         fun folder(context: Context): File = File(context.filesDir, "audio").apply { mkdirs() }
     }
     private var recorder: MediaRecorder? = null
     private var target: File? = null
+    private var sharedTarget: android.net.Uri? = null
+    private var descriptor: ParcelFileDescriptor? = null
     private val handler = Handler(Looper.getMainLooper())
     private var accumulated = 0L
     private var segmentStart = 0L
@@ -44,8 +48,9 @@ class RecorderService : Service() {
                 }
                 if (limitSeconds > 0L && seconds >= limitSeconds) { stopRecording(); return }
                 amplitude = if (state == "recording") (recorder?.runCatching { maxAmplitude }?.getOrNull() ?: 0) else 0
-                broadcastState()
-                handler.postDelayed(this, 180)
+                recordedMs = accumulated + if (state == "recording") SystemClock.elapsedRealtime() - segmentStart else 0L
+                if (state == "recording") peaks.add(amplitude)
+                handler.postDelayed(this, 40)
             }
         }
     }
@@ -89,8 +94,9 @@ class RecorderService : Service() {
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         limitSeconds = prefs.getLong("limit_seconds", 180L)
         timerMode = prefs.getString("timer_mode", "record") ?: "record"
-        seconds = 0L; accumulated = 0L
-        target = File(folder(this), SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date()) + ".m4a")
+        seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear()
+        val name = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.US).format(Date()) + ".m4a"
+        target = null; sharedTarget = null
         try {
             // Promotion to foreground occurs while the activity is visible and recording is authorized.
             promote()
@@ -103,7 +109,16 @@ class RecorderService : Service() {
             media.setAudioChannels(1)
             media.setAudioEncodingBitRate(prefs.getInt("bitrate", 64000))
             media.setAudioSamplingRate(44100)
-            media.setOutputFile(target!!.absolutePath)
+            if (Build.VERSION.SDK_INT >= 29) {
+                val uri = AudioStorage.create(this, name)
+                sharedTarget = uri
+                val fd = contentResolver.openFileDescriptor(uri, "rw") ?: error("Fichier inaccessible")
+                descriptor = fd
+                media.setOutputFile(fd.fileDescriptor)
+            } else {
+                target = File(folder(this), name)
+                media.setOutputFile(target!!.absolutePath)
+            }
             media.prepare()
             media.start()
             wallStart = SystemClock.elapsedRealtime()
@@ -116,7 +131,7 @@ class RecorderService : Service() {
         } catch (e: Exception) {
             recorder?.runCatching { release() }
             recorder = null
-            target?.delete()
+            finalizeTarget(false)
             state = "idle"
             broadcastState("Impossible de démarrer : ${e.localizedMessage}")
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -149,11 +164,25 @@ class RecorderService : Service() {
         var valid = true
         try { current?.stop() } catch (_: RuntimeException) { valid = false }
         finally { current?.runCatching { release() } }
-        if (!valid) target?.delete()
+        valid = finalizeTarget(valid)
         state = "idle"; seconds = 0L; amplitude = 0
         broadcastState(if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+    private fun finalizeTarget(valid: Boolean): Boolean {
+        runCatching { descriptor?.close() }; descriptor = null
+        val uri = sharedTarget; sharedTarget = null
+        val file = target; target = null
+        if (uri != null) {
+            return runCatching {
+                if (valid) contentResolver.update(uri, ContentValues().apply { put(android.provider.MediaStore.Audio.Media.IS_PENDING, 0) }, null, null) > 0
+                else { contentResolver.delete(uri, null, null); false }
+            }.getOrDefault(false)
+        }
+        if (!valid) file?.delete()
+        else if (file != null) runCatching { File(file.path + ".peaks").writeText(peaks.joinToString(",")) }
+        return valid && file != null
     }
     private fun actionIntent(action: String): PendingIntent = PendingIntent.getService(
         this, action.hashCode(), Intent(this, RecorderService::class.java).setAction(action),
@@ -164,8 +193,9 @@ class RecorderService : Service() {
         val label = if (state == "paused") "Enregistrement en pause" else "Enregistrement audio en cours"
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_audio)
-            .setContentTitle(label)
-            .setContentText("Appuyez pour ouvrir l'application")
+            .setContentTitle("Convertisseur · Audio")
+            .setContentText(label)
+            .setShowWhen(false)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -183,8 +213,9 @@ class RecorderService : Service() {
         handler.removeCallbacks(clock)
         callback?.let { audioManager.unregisterAudioDeviceCallback(it) }
         if (recorder != null) {
-            try { recorder?.stop() } catch (_: Exception) { target?.delete() }
-            recorder?.release(); recorder = null
+            val valid = runCatching { recorder?.stop() }.isSuccess
+            runCatching { recorder?.release() }; recorder = null
+            finalizeTarget(valid)
         }
         state = "idle"
         super.onDestroy()

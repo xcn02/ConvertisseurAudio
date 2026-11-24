@@ -58,7 +58,7 @@ class MainActivity : Activity() {
     private var pauseButton: Button? = null
     private var waveform: WaveformView? = null
     private val uiHandler = Handler(Looper.getMainLooper())
-    private val meterTick = object : Runnable { override fun run() { if (page == "audio") { updateRecorderControls(); waveform?.push(RecorderService.amplitude); uiHandler.postDelayed(this, 180) } } }
+    private val meterTick = object : Runnable { override fun run() { if (page == "audio") { updateRecorderControls(); waveform?.live(RecorderService.peaks, RecorderService.recordedMs); uiHandler.postDelayed(this, 40) } } }
     private var startButton: Button? = null
     private val colors = intArrayOf(0xff152238.toInt(), 0xff536174.toInt())
 
@@ -70,7 +70,7 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 22)
         renderConverter()
     }
-    override fun onStart() { super.onStart(); if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE), RECEIVER_NOT_EXPORTED) else @Suppress("DEPRECATION") registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE)) }
+    override fun onStart() { super.onStart(); if (page == "audio") { uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick) }; if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE), RECEIVER_NOT_EXPORTED) else @Suppress("DEPRECATION") registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE)) }
     override fun onStop() { uiHandler.removeCallbacks(meterTick); super.onStop(); unregisterReceiver(receiver) }
     override fun onDestroy() { player?.release(); super.onDestroy() }
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -95,7 +95,7 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
-        when (page) { "converter" -> super.onBackPressed(); "settings" -> renderConverter(); "audio" -> showSettings(); "audio_settings" -> showAudio(); "files" -> showAudio(); else -> renderConverter() }
+        when (page) { "converter" -> super.onBackPressed(); "settings" -> renderConverter(); "audio" -> showSettings(); "audio_settings" -> showAudio(); "files" -> showAudio(); "player" -> { player?.release(); player = null; showFiles() }; else -> renderConverter() }
     }
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun text(s: String, size: Float = 16f, bold: Boolean = false): TextView = TextView(this).apply {
@@ -210,24 +210,23 @@ class MainActivity : Activity() {
         root.addView(button("Enregistreur audio  ›") { showAudio() })
         heading("Application")
         root.addView(text("Stockage local uniquement. Pas de connexion réseau, compte ou suivi publicitaire."))
-        root.addView(text("Les indicateurs et notifications d'enregistrement d'Android restent actifs."))
-        root.addView(text("Version 0.5.2 • Projet de développement", 13f))
+        root.addView(text("Version 0.6.0 • Projet de développement", 13f))
     }
     private fun showAudio() {
-        page = "audio"; screen("Enregistreur audio", "La capture est signalée par Android et la notification de l'application.")
+        page = "audio"; screen("Enregistreur audio")
         root.addView(button("← Paramètres") { showSettings() })
         heading("Enregistrement")
         status = text("", 22f, true).also { root.addView(it) }
+        waveform = WaveformView(this).also { cardAdd(it) }
         startButton = button("● Démarrer") { startRecording() }.also { root.addView(it) }
         pauseButton = button("Pause") {
             sendAction(if (RecorderService.state == "paused") RecorderService.ACTION_RESUME else RecorderService.ACTION_PAUSE)
             Handler(Looper.getMainLooper()).postDelayed({ updateRecorderControls() }, 200)
         }.also { root.addView(it) }
         root.addView(button("■ Arrêter et sauvegarder") { sendAction(RecorderService.ACTION_STOP); Handler(Looper.getMainLooper()).postDelayed({ updateRecorderControls() }, 300) })
-        root.addView(button("Arrêter, sauvegarder et fermer") { sendAction(RecorderService.ACTION_STOP); renderConverter(); finish() })
         root.addView(button("Ouvrir les enregistrements ›") { showFiles() })
         updateRecorderControls()
-        waveform = WaveformView(this).also { cardAdd(it) }
+
         root.addView(button("⚙  Réglages de l’enregistreur") { showAudioSettings() })
         uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick)
     }
@@ -269,7 +268,8 @@ class MainActivity : Activity() {
             }
         }
         root.addView(quickStop)
-        root.addView(text("Fonctionne sur l'écran Enregistreur lorsque l'application est visible et qu'un enregistrement est actif. Avec l'écran verrouillé, utilisez l'action Arrêter de la notification Android.", 13f))
+        heading("Stockage")
+        root.addView(text(if (Build.VERSION.SDK_INT >= 29) "Nouveaux enregistrements : Music/Convertisseur/Recordings. Un seul original, accessible dans le gestionnaire de fichiers." else "Stockage interne sur Android 8 et 9 ; export manuel disponible.", 14f))
         heading("Écouteurs et périphériques")
         rule("Jack : débranchement", "jack_off", "pause")
         rule("Jack : branchement", "jack_on", "none")
@@ -287,8 +287,8 @@ class MainActivity : Activity() {
     private fun updateRecorderControls() {
         val state = RecorderService.state
         status?.text = when (state) {
-            "recording" -> "● Enregistrement : ${RecorderService.seconds} s"
-            "paused" -> "Ⅱ En pause : ${RecorderService.seconds} s"
+            "recording" -> "● Enregistrement : ${formatTime(RecorderService.recordedMs)}"
+            "paused" -> "Ⅱ En pause : ${formatTime(RecorderService.recordedMs)}"
             else -> "Prêt à enregistrer"
         }
         startButton?.isEnabled = state == "idle"
@@ -314,18 +314,25 @@ class MainActivity : Activity() {
     private fun showFiles() {
         page = "files"; screen("Enregistrements", "Fichiers M4A stockés uniquement sur cet appareil")
         root.addView(button("← Enregistreur") { showAudio() })
-        val files = RecorderService.folder(this).listFiles()?.filter { it.extension == "m4a" }?.sortedByDescending { it.lastModified() } ?: emptyList()
+        val files = runCatching { AudioStorage.list(this) }.getOrElse { root.addView(text("Bibliothèque inaccessible")); return }
         if (files.isEmpty()) { root.addView(text("Aucun fichier enregistré.")); return }
         files.forEach { file ->
-            heading(file.nameWithoutExtension.replace('_', ' '))
-            root.addView(text("${file.length() / 1024L} Ko", 13f))
-            root.addView(button("▶ Écouter / arrêter") {
-                player?.release(); player = null
-                try {
-                    player = MediaPlayer().apply { setDataSource(file.absolutePath); prepare(); start(); setOnCompletionListener { it.release(); player = null } }
-                } catch (e: Exception) { Toast.makeText(this, "Lecture impossible", Toast.LENGTH_SHORT).show() }
+            heading(file.title.replace('_', ' '))
+            root.addView(text("${file.size / 1024L} Ko", 13f))
+            root.addView(button("▶ Écouter") { showPlayer(file) })
+            root.addView(button("Renommer") {
+                val input = field(file.title)
+                android.app.AlertDialog.Builder(this).setTitle("Renommer").setView(input).setNegativeButton("Annuler", null).setPositiveButton("OK") { _, _ ->
+                    val name = input.text.toString().trim()
+                    if (runCatching { file.rename(this, name) }.getOrDefault(false)) showFiles()
+                    else Toast.makeText(this, "Renommage impossible", Toast.LENGTH_SHORT).show()
+                }.show()
             })
-            root.addView(button("Partager le fichier") {
+            root.addView(button("Partager / exporter le fichier") {
+                if (file.uri != null) {
+                    val share = Intent(Intent.ACTION_SEND).apply { type = "audio/mp4"; putExtra(Intent.EXTRA_STREAM, file.uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION); clipData = ClipData.newRawUri(file.name, file.uri) }
+                    startActivity(Intent.createChooser(share, "Partager l’enregistrement")); return@button
+                }
                 // No FileProvider dependency: use document export through ACTION_CREATE_DOCUMENT.
                 pendingExport = file
                 val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "audio/mp4"; putExtra(Intent.EXTRA_TITLE, file.name) }
@@ -334,18 +341,52 @@ class MainActivity : Activity() {
             root.addView(button("Supprimer") {
                 android.app.AlertDialog.Builder(this).setTitle("Supprimer ce fichier ?")
                     .setMessage(file.name).setNegativeButton("Annuler", null)
-                    .setPositiveButton("Supprimer") { _, _ -> if (file.delete()) showFiles() else Toast.makeText(this, "Suppression impossible", Toast.LENGTH_SHORT).show() }.show()
+                    .setPositiveButton("Supprimer") { _, _ -> if (runCatching { file.delete(this) }.getOrDefault(false)) { showFiles() } else Toast.makeText(this, "Suppression impossible", Toast.LENGTH_SHORT).show() }.show()
             })
         }
     }
-    private var pendingExport: File? = null
+    private fun formatTime(ms: Long): String = String.format(Locale.FRANCE, "%02d:%02d,%02d", ms / 60000, ms / 1000 % 60, ms / 10 % 100)
+    private fun showPlayer(file: AudioStorage.Recording) {
+        player?.release(); player = null
+        page = "player"; screen(file.title)
+        root.addView(button("← Bibliothèque") { player?.release(); player = null; showFiles() })
+        val media = try { MediaPlayer().apply { if (file.uri != null) setDataSource(this@MainActivity, file.uri) else setDataSource(file.file!!.absolutePath); prepare() } } catch (_: Exception) { root.addView(text("Lecture impossible")); return }
+        player = media
+        val duration = media.duration.coerceAtLeast(1)
+        val time = text("", 30f, true).also { root.addView(it) }
+        val wave = WaveformView(this).also { cardAdd(it) }
+        wave.playback(emptyList(), duration, 0) { media.seekTo(it) }
+        Thread {
+            val peaks = AudioStorage.decodePeaks(this, file)
+            runOnUiThread { if (player === media) wave.playback(peaks, duration, media.currentPosition) { media.seekTo(it) } }
+        }.start()
+        val seek = SeekBar(this).apply { max = duration; setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar?, value: Int, user: Boolean) { if (user) media.seekTo(value) }
+            override fun onStartTrackingTouch(bar: SeekBar?) {}
+            override fun onStopTrackingTouch(bar: SeekBar?) {}
+        }) }; root.addView(seek)
+        val play = button("Lecture / Pause") { if (media.isPlaying) media.pause() else media.start() }; root.addView(play)
+        root.addView(button("−10 secondes") { media.seekTo((media.currentPosition - 10000).coerceAtLeast(0)) })
+        root.addView(button("+10 secondes") { media.seekTo((media.currentPosition + 10000).coerceAtMost(duration)) })
+        val speeds = listOf(.5f, .75f, 1f, 1.25f, 1.5f, 2f)
+        val speed = spinner(speeds.map { "×$it" }, 2); root.addView(speed)
+        speed.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { runCatching { val playing = media.isPlaying; media.playbackParams = media.playbackParams.setSpeed(speeds[position]); if (!playing) media.pause() } }
+        }
+        uiHandler.post(object : Runnable { override fun run() {
+            if (player !== media || page != "player") return
+            val current = media.currentPosition; time.text = formatTime(current) + " / " + formatTime(duration.toLong()); seek.progress = current; wave.position(current); uiHandler.postDelayed(this, 40)
+        } })
+    }
+    private var pendingExport: AudioStorage.Recording? = null
     @Deprecated("Document export result")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == 101 && resultCode == RESULT_OK) {
             val src = pendingExport; val uri = data?.data
             if (src != null && uri != null) {
-                try { contentResolver.openOutputStream(uri)?.use { out -> src.inputStream().use { it.copyTo(out) } }; Toast.makeText(this, "Fichier exporté", Toast.LENGTH_SHORT).show() }
+                try { contentResolver.openOutputStream(uri)?.use { out -> src.open(this).use { it.copyTo(out) } }; Toast.makeText(this, "Fichier exporté", Toast.LENGTH_SHORT).show() }
                 catch (_: Exception) { Toast.makeText(this, "Échec de l'export", Toast.LENGTH_SHORT).show() }
             }
             pendingExport = null
