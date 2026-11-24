@@ -18,6 +18,31 @@ class MainActivity : Activity() {
     private lateinit var root: LinearLayout
     private var page = "converter"
     private var player: MediaPlayer? = null
+    private var activeFile: String? = null
+    private var equalizer: android.media.audiofx.Equalizer? = null
+    private fun releasePlayer() {
+        player?.let { m -> activeFile?.let { k -> runCatching { prefs.edit().putInt("position:$k", m.currentPosition).apply() } } }
+        equalizer?.release(); equalizer = null
+        player?.release(); player = null; activeFile = null
+    }
+    private fun mediaFor(file: AudioStorage.Recording): MediaPlayer? {
+        if (activeFile == file.key && player != null) return player
+        releasePlayer()
+        val m = MediaPlayer()
+        return try {
+            if (file.uri != null) m.setDataSource(this, file.uri) else m.setDataSource(file.file!!.absolutePath)
+            m.prepare(); m.seekTo(prefs.getInt("position:${file.key}",0).coerceIn(0,m.duration.coerceAtLeast(0)))
+            player=m; activeFile=file.key; m
+        } catch (_: Exception) { m.release(); null }
+    }
+    private fun durationOf(file: AudioStorage.Recording): Long {
+        val r = android.media.MediaMetadataRetriever()
+        return try { if(file.uri!=null) r.setDataSource(this,file.uri) else r.setDataSource(file.file!!.path); r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L }
+        catch (_: Exception) { 0L } finally { runCatching { r.release() } }
+    }
+    private fun shortTime(ms: Long) = String.format(Locale.FRANCE,"%02d:%02d",ms/60000,ms/1000%60)
+    private fun iconButton(label:String, description:String, action:()->Unit): Button = button(label,action).apply { background=null; minWidth=0; minimumWidth=0; textSize=22f; contentDescription=description }
+
     private var lastVolumeDownMs = 0L
     private val volumeDoublePressWindowMs = 650L
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
@@ -71,14 +96,14 @@ class MainActivity : Activity() {
         setTheme(if (dark) R.style.AppThemeDark else R.style.AppTheme)
         super.onCreate(savedInstanceState)
         // Protects screen content in recent-app previews and screenshots.
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        applyPrivacy()
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 22)
         renderConverter()
     }
     override fun onStart() { super.onStart(); if (page == "audio") { uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick) }; if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE), RECEIVER_NOT_EXPORTED) else @Suppress("DEPRECATION") registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE)) }
     override fun onStop() { uiHandler.removeCallbacks(meterTick); super.onStop(); unregisterReceiver(receiver) }
-    override fun onDestroy() { player?.release(); super.onDestroy() }
+    override fun onDestroy() { releasePlayer(); uiHandler.removeCallbacksAndMessages(null); super.onDestroy() }
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // This shortcut only works while the recorder screen is in the foreground.
         // Never intercept hardware keys when the app is backgrounded or the screen is locked.
@@ -101,7 +126,11 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
-        when (page) { "converter" -> super.onBackPressed(); "settings" -> renderConverter(); "audio" -> showSettings(); "audio_settings" -> showAudio(); "files" -> { selected.clear(); if(trashMode) { trashMode=false; showFiles() } else showAudio() }; "player" -> { player?.release(); player = null; showFiles() }; else -> renderConverter() }
+        when (page) { "converter" -> super.onBackPressed(); "settings" -> renderConverter(); "audio" -> showSettings(); "audio_settings" -> showAudio(); "files" -> { selected.clear(); if(trashMode) { trashMode=false; showFiles() } else showAudio() }; "player" -> showFiles(); else -> renderConverter() }
+    }
+    private fun applyPrivacy() {
+        if (prefs.getBoolean("secure_screen", false)) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
     }
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun text(s: String, size: Float = 16f, bold: Boolean = false): TextView = TextView(this).apply {
@@ -150,44 +179,55 @@ class MainActivity : Activity() {
     }
     private fun renderConverter() {
         uiHandler.removeCallbacks(meterTick); waveform = null
-        page = "converter"; screen("Convertisseur")
+        page = "converter"; screen("Convertisseur"); releasePlayer()
+        root.removeAllViews()
+        root.setBackgroundColor(if(dark) 0xff1C1C1C.toInt() else 0xffF6F6F6.toInt())
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        top.addView(text("Conversions", 19f, true), LinearLayout.LayoutParams(0,-2,1f))
-        top.addView(button("⋮") { showSettings() }, LinearLayout.LayoutParams(dp(58),dp(48)))
-        root.addView(top); space(12)
-        root.addView(text("Catégorie", 15f, true))
-        val categoryNames = categories.keys.toList()
-        val cat = spinner(categoryNames, prefs.getInt("category", 0))
-        root.addView(cat); space(15)
-        val source = field("1", "Valeur")
-        source.inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
-        root.addView(text("Valeur à convertir", 15f, true)); root.addView(source)
-        val from = spinner(listOf("m")); val to = spinner(listOf("km"))
-        root.addView(text("De", 15f, true)); root.addView(from)
-        root.addView(text("Vers", 15f, true)); root.addView(to)
-        val answer = text("", 26f, true)
-        space(18); val resultCard = card(); resultCard.addView(text("RÉSULTAT", 12f, true)); resultCard.addView(answer); cardAdd(resultCard)
-        val format = DecimalFormat("0.##########")
+        top.addView(text("Convertisseur",28f,true),LinearLayout.LayoutParams(0,-2,1f))
+        top.addView(iconButton("⚙","Paramètres") { showSettings() },LinearLayout.LayoutParams(dp(48),dp(48))); root.addView(top)
+        val search=field("","Rechercher une grandeur").apply { background=android.graphics.drawable.GradientDrawable().apply { setColor(if(dark) 0xff272727.toInt() else 0xffEAEAEA.toInt()); cornerRadius=dp(18).toFloat() }; setPadding(dp(16),dp(12),dp(16),dp(12)) }
+        root.addView(search); space(12); root.addView(text("Catégorie",14f))
+        val categoryNames=categories.keys.toList()
+        val cat=spinner(categoryNames,prefs.getInt("category",0)); root.addView(cat); space(12)
+        val source=field("1","Valeur").apply { textSize=32f; background=null; setPadding(0,0,0,0); inputType=android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED }
+        val from=spinner(listOf("m")); val to=spinner(listOf("km")); val answer=text("",32f,true)
+        fun conversionBlock(label:String,value:View,unit:View,outlined:Boolean) {
+            val block=card().apply { background=android.graphics.drawable.GradientDrawable().apply { cornerRadius=dp(22).toFloat(); setColor(if(dark) (if(outlined) 0xff1C1C1C.toInt() else 0xff272727.toInt()) else (if(outlined) 0xffF6F6F6.toInt() else 0xffEAEAEA.toInt())); if(outlined) setStroke(dp(1),if(dark) 0xff414141.toInt() else 0xffC7C7C7.toInt()) } }
+            block.addView(text(label,14f)); val row=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL }; row.addView(value,LinearLayout.LayoutParams(0,-2,1f)); row.addView(unit,LinearLayout.LayoutParams(dp(110),-2)); block.addView(row); root.addView(block)
+        }
+        conversionBlock("De",source,from,true); space(8)
+        val swapRow=LinearLayout(this).apply { gravity=Gravity.CENTER }; swapRow.addView(iconButton("⇅","Inverser les unités") { val a=from.selectedItemPosition; from.setSelection(to.selectedItemPosition); to.setSelection(a) },LinearLayout.LayoutParams(dp(54),dp(54))); root.addView(swapRow); space(8)
+        conversionBlock("Vers",answer,to,false)
+        val actions=LinearLayout(this).apply { gravity=Gravity.END }; actions.addView(iconButton("☆","Mémoriser les unités") { prefs.edit().putString("favorite_from",from.selectedItem.toString()).putString("favorite_to",to.selectedItem.toString()).putInt("favorite_category",cat.selectedItemPosition).apply(); Toast.makeText(this,"Conversion mémorisée",Toast.LENGTH_SHORT).show() }); actions.addView(iconButton("▢","Copier le résultat") { (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversion", "${answer.text} ${to.selectedItem}")) }); root.addView(actions)
+        root.addView(text("Autres équivalences",14f)); val equivalents=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }; root.addView(equivalents)
+        search.addTextChangedListener(object:TextWatcher { override fun beforeTextChanged(s:CharSequence?,start:Int,count:Int,after:Int){}; override fun afterTextChanged(s:Editable?){}; override fun onTextChanged(s:CharSequence?,start:Int,before:Int,count:Int){ val q=s.toString().trim(); if(q.isNotEmpty()) categoryNames.indexOfFirst { it.contains(q,true) }.takeIf { it>=0 }?.let { cat.setSelection(it) } } })
+        val format = DecimalFormat("#,##0.##########")
         var refreshing = false
         fun calculate() {
-            val n = source.text.toString().replace(',', '.').toDoubleOrNull()
-            if (n == null) { answer.text = "Saisissez un nombre"; return }
+            val n = source.text.toString().replace(" ","").replace("\u202f","").replace(',', '.').toDoubleOrNull()
+            if (n == null) { answer.text = "—"; equivalents.removeAllViews(); return }
             val category = categoryNames.getOrNull(cat.selectedItemPosition) ?: return
             val units = categories.getValue(category)
             val left = from.selectedItem.toString(); val right = to.selectedItem.toString()
             if(left !in units || right !in units) return
-            val result = if (category == "Température") {
+            fun convert(right: String): Double = if (category == "Température") {
                 val kelvin = when (left) { "°C" -> n + 273.15; "°F" -> (n - 32) * 5.0 / 9 + 273.15; else -> n }
                 when (right) { "°C" -> kelvin - 273.15; "°F" -> (kelvin - 273.15) * 9.0 / 5 + 32; else -> kelvin }
             } else n * units.getValue(left) / units.getValue(right)
-            answer.text = if (result.isFinite()) "${format.format(result)} $right" else "Valeur hors plage"
+            val result=convert(right)
+            answer.text = if (result.isFinite()) format.format(result) else "—"
+            equivalents.removeAllViews()
+            units.keys.filter { it!=left && it!=right }.forEach { u -> val row=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL }; row.addView(text(u,16f),LinearLayout.LayoutParams(0,-2,1f)); row.addView(text(format.format(convert(u)),16f,true)); equivalents.addView(row) }
         }
         fun refreshUnits() {
             refreshing = true
             val names = categories.getValue(categoryNames.getOrNull(cat.selectedItemPosition) ?: return).keys.toList()
             from.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
             to.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
-            to.setSelection(if (names.size > 2) 2 else 1)
+            if(prefs.getInt("favorite_category",-1)==cat.selectedItemPosition) {
+                from.setSelection(names.indexOf(prefs.getString("favorite_from",null)).coerceAtLeast(0))
+                to.setSelection(names.indexOf(prefs.getString("favorite_to",null)).coerceAtLeast(0))
+            } else to.setSelection(if (names.size > 2) 2 else 1)
             refreshing = false
             calculate()
         }
@@ -205,20 +245,18 @@ class MainActivity : Activity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = calculate()
             override fun afterTextChanged(s: Editable?) {}
         })
-        root.addView(button("Copier le résultat") { (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversion",answer.text)) })
-        root.addView(button("⇄  Inverser les unités") {
-            val a = from.selectedItemPosition; from.setSelection(to.selectedItemPosition); to.setSelection(a); calculate()
-        })
+        refreshUnits()
     }
     private fun showSettings() {
         uiHandler.removeCallbacks(meterTick); waveform = null
         page = "settings"; screen("Paramètres", "Convertisseur et modules")
         root.addView(button("← Convertisseur") { renderConverter() })
+        root.addView(CheckBox(this).apply { text="Bloquer les captures d’écran"; isChecked=prefs.getBoolean("secure_screen",false); setOnCheckedChangeListener { _,checked -> prefs.edit().putBoolean("secure_screen",checked).apply(); applyPrivacy() } })
         heading("Modules")
         root.addView(button("Enregistreur audio  ›") { showAudio() })
         heading("Application")
         root.addView(text("Stockage local uniquement. Pas de connexion réseau, compte ou suivi publicitaire."))
-        root.addView(text("Version 0.7.0", 13f))
+        root.addView(text("Version 0.8.0", 13f))
     }
     private fun toolbar(back: () -> Unit, action: String, next: () -> Unit) {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -233,7 +271,7 @@ class MainActivity : Activity() {
         backgroundTintList=null; setTextColor(if(dark) 0xff182235.toInt() else -1); textSize=26f
     }
     private fun showAudio() {
-        page = "audio"; screen("Enregistreur audio")
+        releasePlayer(); page = "audio"; screen("Enregistreur audio")
         toolbar({showSettings()}, "⚙ Réglages", {showAudioSettings()})
         space(30)
         status = text("", 15f).apply { gravity=Gravity.CENTER }.also { root.addView(it) }
@@ -316,16 +354,20 @@ class MainActivity : Activity() {
         status?.text = when (state) {
             "recording" -> "Enregistrement en cours"
             "paused" -> "En pause"
+            "connecting" -> "Connexion Bluetooth…"
             else -> "Prêt à enregistrer"
         }
         timerText?.text = formatTime(if(state=="idle") 0L else RecorderService.recordedMs)
         routeText?.text = if(state=="idle") "" else RecorderService.routeLabel
         startButton?.text = if(state=="idle") "●" else "■"
         startButton?.contentDescription = if(state=="idle") "Démarrer l’enregistrement" else "Arrêter et sauvegarder"
-        pauseButton?.isEnabled = state != "idle"
+        pauseButton?.isEnabled = state == "recording" || state == "paused"
         pauseButton?.text = if (state == "paused") "Reprendre" else "Pause"
     }
     private fun startRecording() {
+        if (Build.VERSION.SDK_INT >= 31 && prefs.getString("mic_source","auto")=="bluetooth" && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)!=PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT),18); return
+        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 17)
         } else {
@@ -335,7 +377,7 @@ class MainActivity : Activity() {
     }
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 17 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) startRecording()
+        if (requestCode in listOf(17,18) && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) startRecording()
     }
     private fun sendAction(action: String) {
         val intent = Intent(this, RecorderService::class.java).setAction(action)
@@ -358,6 +400,7 @@ class MainActivity : Activity() {
     }
     private fun fileAction(files: List<AudioStorage.Recording>, restore: Boolean = false) {
         if(files.isEmpty()) return
+        if(files.any { it.key==activeFile }) releasePlayer()
         val permanent = trashMode && !restore
         android.app.AlertDialog.Builder(this).setTitle(if(restore) "Restaurer ?" else if(permanent) "Supprimer définitivement ?" else "Retirer les fichiers ?")
             .setMessage(if(!restore && !permanent) "Corbeille sur Android 11 et ultérieur pour les fichiers partagés ; suppression définitive sinon." else "${files.size} fichier(s)")
@@ -370,7 +413,9 @@ class MainActivity : Activity() {
     private fun showFiles() {
         uiHandler.removeCallbacks(meterTick); waveform=null
         page = "files"; screen(if(trashMode) "Corbeille" else "Enregistrements")
-        toolbar({ selected.clear(); if(trashMode) { trashMode=false; showFiles() } else showAudio() }, if(trashMode) "Bibliothèque" else "Corbeille", { selected.clear(); trashMode=!trashMode; showFiles() })
+        val bar=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL }
+        bar.addView(iconButton("‹","Retour") { onBackPressed() }); bar.addView(Space(this),LinearLayout.LayoutParams(0,1,1f))
+        if(!trashMode) bar.addView(iconButton("🗑","Corbeille") { selected.clear(); trashMode=true; showFiles() }); root.addView(bar)
         val files = runCatching { AudioStorage.list(this,trashMode) }.getOrElse { root.addView(text("Bibliothèque inaccessible")); return }
         if(selected.isNotEmpty()) {
             val chosen=files.filter { it.key in selected }
@@ -382,25 +427,29 @@ class MainActivity : Activity() {
             val row=LinearLayout(this).apply { orientation=LinearLayout.HORIZONTAL; gravity=Gravity.CENTER_VERTICAL; setPadding(0,dp(7),0,dp(7)) }
             val toggle={ if(!selected.add(file.key)) selected.remove(file.key); showFiles() }
             if(selected.isNotEmpty()) row.addView(CheckBox(this).apply { isChecked=file.key in selected; setOnClickListener { toggle() } })
-            val details=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; addView(text(file.title.replace('_',' '),16f,true)); addView(text("${dates.format(java.util.Date(file.modified))} · ${file.size/1024} Ko",12f)); setOnClickListener { if(selected.isNotEmpty() || trashMode) toggle() else showPlayer(file) }; setOnLongClickListener { toggle(); true } }
+            val details=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; addView(text(file.title.replace('_',' '),16f,true)); addView(text("${shortTime(durationOf(file))} · ${dates.format(java.util.Date(file.modified))}",12f)); setOnClickListener { if(selected.isNotEmpty() || trashMode) toggle() else showPlayer(file) }; setOnLongClickListener { toggle(); true } }
             row.addView(details,LinearLayout.LayoutParams(0,-2,1f))
-            if(!trashMode && selected.isEmpty()) row.addView(button("▶") { showPlayer(file) },LinearLayout.LayoutParams(dp(48),dp(48)))
+            if(!trashMode && selected.isEmpty()) row.addView(iconButton(if(activeFile==file.key && player?.isPlaying==true) "Ⅱ" else "▶","Lecture rapide") { val m=mediaFor(file); if(m!=null) { if(m.isPlaying) m.pause() else m.start(); showFiles() } },LinearLayout.LayoutParams(dp(48),dp(48)))
             row.addView(button("⋮") { val menu=if(trashMode) arrayOf("Restaurer","Supprimer définitivement") else arrayOf("Renommer","Partager","Supprimer","Sélectionner"); android.app.AlertDialog.Builder(this).setItems(menu) { _,i ->
                 if(trashMode) fileAction(listOf(file),i==0) else when(i) {
                     0 -> { val input=field(file.title); android.app.AlertDialog.Builder(this).setTitle("Renommer").setView(input).setNegativeButton("Annuler",null).setPositiveButton("OK") { _,_ -> if(runCatching { file.rename(this,input.text.toString().trim()) }.getOrDefault(false)) showFiles() else Toast.makeText(this,"Renommage impossible",Toast.LENGTH_SHORT).show() }.show() }
                     1 -> shareFiles(listOf(file)); 2 -> fileAction(listOf(file)); 3 -> toggle()
                 }
             }.show() },LinearLayout.LayoutParams(dp(48),dp(48)))
-            root.addView(row); root.addView(View(this).apply { setBackgroundColor(if(dark) 0xff39404B.toInt() else 0xffE2E6ED.toInt()) },LinearLayout.LayoutParams(-1,dp(1)))
+            root.addView(row)
+            if(!trashMode && activeFile==file.key && selected.isEmpty()) {
+                val m=player!!; val bar=SeekBar(this).apply { max=m.duration.coerceAtLeast(1); progress=m.currentPosition; setOnSeekBarChangeListener(object:SeekBar.OnSeekBarChangeListener { override fun onProgressChanged(b:SeekBar?,v:Int,user:Boolean){ if(user && player===m) m.seekTo(v) }; override fun onStartTrackingTouch(b:SeekBar?){}; override fun onStopTrackingTouch(b:SeekBar?){} }) }; root.addView(bar)
+                val t=text("",12f); root.addView(t)
+                uiHandler.post(object:Runnable { override fun run(){ if(page!="files" || player!==m || !bar.isAttachedToWindow) return; bar.progress=m.currentPosition; t.text="${shortTime(m.currentPosition.toLong())} / ${shortTime(m.duration.toLong())}"; uiHandler.postDelayed(this,150) } })
+            }
+            root.addView(View(this).apply { setBackgroundColor(if(dark) 0xff39404B.toInt() else 0xffE2E6ED.toInt()) },LinearLayout.LayoutParams(-1,dp(1)))
         }
     }
     private fun formatTime(ms: Long): String = String.format(Locale.FRANCE, "%02d:%02d,%02d", ms / 60000, ms / 1000 % 60, ms / 10 % 100)
     private fun showPlayer(file: AudioStorage.Recording) {
-        player?.release(); player = null
         page = "player"; screen(file.title)
-        toolbar({player?.release(); player=null; showFiles()}, "Partager", { shareFiles(listOf(file)) })
-        val media = try { MediaPlayer().apply { if (file.uri != null) setDataSource(this@MainActivity, file.uri) else setDataSource(file.file!!.absolutePath); prepare() } } catch (_: Exception) { root.addView(text("Lecture impossible")); return }
-        player = media
+        toolbar({showFiles()}, "Partager", { shareFiles(listOf(file)) })
+        val media=mediaFor(file) ?: run { root.addView(text("Lecture impossible")); return }
         val duration = media.duration.coerceAtLeast(1)
         val time = text("", 32f, true).apply { gravity=Gravity.CENTER }.also { root.addView(it) }
         val wave = WaveformView(this).also { root.addView(it) }
@@ -422,8 +471,13 @@ class MainActivity : Activity() {
             override fun onNothingSelected(parent: AdapterView<*>?) {}
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { runCatching { val playing = media.isPlaying; media.playbackParams = media.playbackParams.setSpeed(speeds[position]); if (!playing) media.pause() } }
         }
+        val markerKey="markers:${file.key}"
+        controls(button("Marqueur +") { val marks=prefs.getString(markerKey,"").orEmpty().split(',').mapNotNull { it.toIntOrNull() }; prefs.edit().putString(markerKey,(marks+media.currentPosition).distinct().sorted().joinToString(",")).apply(); Toast.makeText(this,"Marqueur ajouté",Toast.LENGTH_SHORT).show() },button("Repères") { val marks=prefs.getString(markerKey,"").orEmpty().split(',').mapNotNull { it.toIntOrNull() }; android.app.AlertDialog.Builder(this).setTitle("Marqueurs").setItems(marks.map { shortTime(it.toLong()) }.toTypedArray()) { _,i -> media.seekTo(marks[i]) }.setNegativeButton("Fermer",null).show() })
+        root.addView(text("Amélioration vocale (égalisation)",14f))
+        val eqMode=spinner(listOf("Original","Voix claire","Bruits extérieurs — filtre léger")); root.addView(eqMode)
+        eqMode.onItemSelectedListener=object:AdapterView.OnItemSelectedListener { override fun onNothingSelected(p:AdapterView<*>?){}; override fun onItemSelected(p:AdapterView<*>?,v:View?,position:Int,id:Long){ equalizer?.release(); equalizer=null; if(position==0) return; runCatching { val eq=android.media.audiofx.Equalizer(0,media.audioSessionId); equalizer=eq; val range=eq.bandLevelRange; for(i in 0 until eq.numberOfBands.toInt()){ val hz=eq.getCenterFreq(i.toShort())/1000; val gain=when { hz<250 -> if(position==2) -900 else -400; hz in 1000..4000 -> 250; else -> 0 }; eq.setBandLevel(i.toShort(),gain.coerceIn(range[0].toInt(),range[1].toInt()).toShort()) }; eq.enabled=true }.onFailure { Toast.makeText(this@MainActivity,"Égaliseur indisponible",Toast.LENGTH_SHORT).show() } } }
         uiHandler.post(object : Runnable { override fun run() {
-            if (player !== media || page != "player") return
+            if (player !== media || page != "player" || !wave.isAttachedToWindow) return
             play.text = if(media.isPlaying) "Ⅱ" else "▶"; val current = media.currentPosition; time.text = formatTime(current.toLong()) + " / " + formatTime(duration.toLong()); seek.progress = current; wave.position(current); uiHandler.postDelayed(this, 40)
         } })
     }

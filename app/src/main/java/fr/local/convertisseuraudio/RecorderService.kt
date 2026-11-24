@@ -28,6 +28,35 @@ class RecorderService : Service() {
         fun folder(context: Context): File = File(context.filesDir, "audio").apply { mkdirs() }
     }
     private var recorder: MediaRecorder? = null
+    private var routingBluetooth = false
+    private var previousMode = AudioManager.MODE_NORMAL
+    private fun clearBluetooth() {
+        if(!routingBluetooth) return
+        routingBluetooth=false
+        runCatching { if(Build.VERSION.SDK_INT>=31) audioManager.clearCommunicationDevice() else { @Suppress("DEPRECATION") audioManager.stopBluetoothSco(); @Suppress("DEPRECATION") audioManager.isBluetoothScoOn=false } }
+        runCatching { audioManager.mode=previousMode }
+    }
+    private fun prepareBluetooth() {
+        try {
+            previousMode=audioManager.mode; routingBluetooth=true; state="connecting"; routeLabel="Connexion du microphone Bluetooth"; promote(); broadcastState()
+            audioManager.mode=AudioManager.MODE_IN_COMMUNICATION
+            if(Build.VERSION.SDK_INT>=31) {
+                val device=audioManager.availableCommunicationDevices.firstOrNull { it.type==AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type==AudioDeviceInfo.TYPE_BLE_HEADSET } ?: error("Profil mains libres absent")
+                check(audioManager.setCommunicationDevice(device)) { "Routage Bluetooth refusé" }
+            } else { @Suppress("DEPRECATION") audioManager.startBluetoothSco(); @Suppress("DEPRECATION") audioManager.isBluetoothScoOn=true }
+            val deadline=SystemClock.elapsedRealtime()+8000L
+            handler.post(object:Runnable { override fun run() {
+                if(state!="connecting") return
+                val input=audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).any { it.type==AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type==AudioDeviceInfo.TYPE_BLE_HEADSET }
+                val routed=if(Build.VERSION.SDK_INT>=31) audioManager.communicationDevice?.type in setOf(AudioDeviceInfo.TYPE_BLUETOOTH_SCO,AudioDeviceInfo.TYPE_BLE_HEADSET) else audioManager.isBluetoothScoOn
+                if(input && routed) { state="idle"; startRecording(true) }
+                else if(SystemClock.elapsedRealtime()<deadline) handler.postDelayed(this,250)
+                else bluetoothFailure("Micro Bluetooth indisponible : délai de connexion dépassé")
+            } })
+        } catch(e:Exception) { bluetoothFailure(e.localizedMessage ?: "Connexion Bluetooth impossible") }
+    }
+    private fun bluetoothFailure(message:String) { clearBluetooth(); state="idle"; broadcastState(message); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+
     private var target: File? = null
     private var sharedTarget: android.net.Uri? = null
     private var descriptor: ParcelFileDescriptor? = null
@@ -94,8 +123,9 @@ class RecorderService : Service() {
         }
         return START_NOT_STICKY
     }
-    private fun startRecording() {
+    private fun startRecording(bluetoothReady:Boolean=false) {
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        if(prefs.getString("mic_source","auto")=="bluetooth" && !bluetoothReady) { prepareBluetooth(); return }
         limitSeconds = prefs.getLong("limit_seconds", 180L)
         timerMode = prefs.getString("timer_mode", "record") ?: "record"
         seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear()
@@ -107,7 +137,7 @@ class RecorderService : Service() {
             @Suppress("DEPRECATION")
             val media = MediaRecorder()
             recorder = media
-            media.setAudioSource(MediaRecorder.AudioSource.MIC)
+            media.setAudioSource(if(bluetoothReady) MediaRecorder.AudioSource.VOICE_COMMUNICATION else MediaRecorder.AudioSource.MIC)
             routeLabel = "Source non vérifiée"
             val source = prefs.getString("mic_source","auto")
             if(source != "auto") {
@@ -124,7 +154,7 @@ class RecorderService : Service() {
             media.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             media.setAudioChannels(1)
             media.setAudioEncodingBitRate(prefs.getInt("bitrate", 64000))
-            media.setAudioSamplingRate(44100)
+            media.setAudioSamplingRate(if(bluetoothReady) 16000 else 44100)
             if (Build.VERSION.SDK_INT >= 29) {
                 val uri = AudioStorage.create(this, name)
                 sharedTarget = uri
@@ -148,7 +178,7 @@ class RecorderService : Service() {
             recorder?.runCatching { release() }
             recorder = null
             finalizeTarget(false)
-            state = "idle"
+            clearBluetooth(); state = "idle"
             broadcastState("Impossible de démarrer : ${e.localizedMessage}")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -173,6 +203,7 @@ class RecorderService : Service() {
         } catch (e: Exception) { stopRecording() }
     }
     private fun stopRecording() {
+        if(state=="connecting") { bluetoothFailure("Connexion annulée"); return }
         if (state == "idle") { stopSelf(); return }
         handler.removeCallbacks(clock)
         val current = recorder
@@ -180,7 +211,7 @@ class RecorderService : Service() {
         var valid = true
         try { current?.stop() } catch (_: RuntimeException) { valid = false }
         finally { current?.runCatching { release() } }
-        valid = finalizeTarget(valid)
+        clearBluetooth(); valid = finalizeTarget(valid)
         state = "idle"; seconds = 0L; amplitude = 0
         broadcastState(if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé")
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -206,7 +237,7 @@ class RecorderService : Service() {
     )
     private fun promote() {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val label = if (state == "paused") "Enregistrement en pause" else "Enregistrement audio en cours"
+        val label = if(state=="connecting") "Connexion du microphone Bluetooth" else if (state == "paused") "Enregistrement en pause" else "Enregistrement audio en cours"
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_audio)
             .setContentTitle("Convertisseur · Audio")
@@ -233,7 +264,7 @@ class RecorderService : Service() {
             runCatching { recorder?.release() }; recorder = null
             finalizeTarget(valid)
         }
-        state = "idle"
+        clearBluetooth(); state = "idle"
         super.onDestroy()
     }
 }
