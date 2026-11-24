@@ -10,8 +10,8 @@ android {
         applicationId = "fr.local.convertisseuraudio"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.7.0"
+        versionCode = 12
+        versionName = "0.7.1"
     }
     buildTypes {
         getByName("release") {

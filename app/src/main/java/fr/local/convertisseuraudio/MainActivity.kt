@@ -205,7 +205,7 @@ class MainActivity : Activity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = calculate()
             override fun afterTextChanged(s: Editable?) {}
         })
-        root.addView(button("Copier le résultat") { (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversion",answer.text)) })
+        root.addView(button("Copier le résultat") { (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversion",answer.text)) })
         root.addView(button("⇄  Inverser les unités") {
             val a = from.selectedItemPosition; from.setSelection(to.selectedItemPosition); to.setSelection(a); calculate()
         })
