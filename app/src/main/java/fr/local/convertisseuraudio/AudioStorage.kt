@@ -7,6 +7,8 @@ import java.io.File
 import kotlin.math.abs
 object AudioStorage {
     data class Recording(val name: String, val size: Long, val modified: Long, val uri: android.net.Uri? = null, val file: File? = null) {
+        val key: String get() = uri?.toString() ?: file!!.absolutePath
+        fun trash(context: Context, value: Boolean): Boolean = Build.VERSION.SDK_INT >= 30 && uri != null && context.contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_TRASHED, if(value) 1 else 0) }, null, null)>0
         val title: String get() = name.removeSuffix(".m4a")
         fun open(context: Context): java.io.InputStream = if (uri != null) context.contentResolver.openInputStream(uri) ?: error("Fichier inaccessible") else file!!.inputStream()
         fun rename(context: Context, name: String): Boolean {
@@ -25,16 +27,21 @@ object AudioStorage {
             put(MediaStore.Audio.Media.IS_PENDING, 1)
         }) ?: error("Impossible de créer le fichier audio")
     }
-    fun list(context: Context): List<Recording> {
+    fun list(context: Context, trashed: Boolean = false): List<Recording> {
         val items = mutableListOf<Recording>()
         if (Build.VERSION.SDK_INT >= 29) {
             val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
             val projection = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.DISPLAY_NAME, MediaStore.Audio.Media.SIZE, MediaStore.Audio.Media.DATE_MODIFIED)
-            context.contentResolver.query(collection, projection, "relative_path = ? AND is_pending = 0", arrayOf("Music/Convertisseur/Recordings/"), null)?.use { c ->
+            val query = if(Build.VERSION.SDK_INT >= 30) context.contentResolver.query(collection,projection,android.os.Bundle().apply {
+                putString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION,"relative_path = ? AND is_pending = 0 AND is_trashed = ?")
+                putStringArray(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,arrayOf("Music/Convertisseur/Recordings/",if(trashed) "1" else "0"))
+                putInt(MediaStore.QUERY_ARG_MATCH_TRASHED,MediaStore.MATCH_INCLUDE)
+            },null) else if(!trashed) context.contentResolver.query(collection,projection,"relative_path = ? AND is_pending = 0",arrayOf("Music/Convertisseur/Recordings/"),null) else null
+            query?.use { c ->
                 while (c.moveToNext()) items.add(Recording(c.getString(1), c.getLong(2), c.getLong(3) * 1000L, ContentUris.withAppendedId(collection, c.getLong(0))))
             }
         }
-        RecorderService.folder(context).listFiles()?.filter { it.extension == "m4a" }?.forEach { items.add(Recording(it.name, it.length(), it.lastModified(), file = it)) }
+        if(!trashed) RecorderService.folder(context).listFiles()?.filter { it.extension == "m4a" }?.forEach { items.add(Recording(it.name, it.length(), it.lastModified(), file = it)) }
         return items.sortedByDescending { it.modified }
     }
     fun decodePeaks(context: Context, recording: Recording): List<Int> {

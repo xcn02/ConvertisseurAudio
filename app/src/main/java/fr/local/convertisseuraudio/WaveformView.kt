@@ -16,22 +16,39 @@ class WaveformView(context: Context): View(context) {
     override fun onMeasure(w: Int, h: Int) { setMeasuredDimension(MeasureSpec.getSize(w), (190 * resources.displayMetrics.density).toInt()) }
     override fun onDraw(c: Canvas) {
         val mid = height * .56f; val density = resources.displayMetrics.density
-        c.drawColor(Color.rgb(24,27,34)); paint.color = Color.GRAY; paint.strokeWidth = 1f; c.drawLine(0f,mid,width.toFloat(),mid,paint)
-        val columns = (width / (2*density)).toInt().coerceAtLeast(1)
-        val count = if (duration > 0) columns else columns/2
-        for (i in 0 until count) {
-            val start = if (duration > 0) i*samples.size/count else (samples.size-count+i)
-            val end = if (duration > 0) ((i+1)*samples.size/count).coerceAtLeast(start+1) else start+1
-            if (start !in samples.indices) continue
-            var peak = 0; for (j in start until min(end,samples.size)) peak = max(peak,samples[j])
-            val half = (peak/32768f).coerceIn(0f,1f).pow(.65f)*height*.36f
-            val x = i*width.toFloat()/columns; paint.color = Color.rgb(158,183,239); paint.strokeWidth = density; c.drawLine(x,mid-half,x,mid+half,paint)
+        val dark = resources.configuration.uiMode and 0x30 == 0x20
+        val fg = if(dark) Color.rgb(169,186,218) else Color.rgb(89,107,141)
+        paint.color = if(dark) Color.rgb(65,76,91) else Color.rgb(216,222,232)
+        paint.strokeWidth = density; c.drawLine(0f,mid,width.toFloat(),mid,paint)
+        val step = 3*density
+        val center = width/2f
+        val current = if(duration>0) cursor.toLong() else elapsed
+        val msPerPixel = 40f/step
+        val columns = (width/step).toInt()
+        for(i in 0..columns) {
+            val x=i*step; val t=current+(x-center)*msPerPixel
+            val index=if(duration>0) (t/duration*samples.size).toInt() else samples.size-1+((x-center)/step).toInt()
+            if(t<0 || (duration>0 && t>duration) || index !in samples.indices || (duration==0 && x>center)) continue
+            val half=(samples[index]/32768f).coerceIn(0f,1f).pow(.65f)*height*.31f
+            paint.color=fg; paint.strokeWidth=1.5f*density; c.drawLine(x,mid-max(1f,half),x,mid+max(1f,half),paint)
         }
-        val x = if (duration > 0) width*cursor.toFloat()/duration else width/2f
-        paint.color = Color.rgb(240,100,100); paint.strokeWidth = 2*density; c.drawLine(x,height*.2f,x,height*.94f,paint)
-        paint.color = Color.LTGRAY; paint.textSize = 12*density
-        val ms = if (duration > 0) cursor.toLong() else elapsed
-        c.drawText(String.format(java.util.Locale.FRANCE,"%02d:%02d",ms/60000,ms/1000%60), 12*density,20*density,paint)
+        paint.color=fg; paint.strokeWidth=2*density; c.drawLine(center,height*.19f,center,height*.91f,paint)
+        paint.textSize=11*density; paint.strokeWidth=density
+        val first=((current-width/2*msPerPixel)/1000).toLong().coerceAtLeast(0)
+        for(sec in first..(first+12)) {
+            val x=center+(sec*1000-current)/msPerPixel
+            if(x<0 || x>width) continue
+            c.drawLine(x,height*.12f,x,height*.16f,paint)
+            c.drawText(String.format(java.util.Locale.FRANCE,"%02d:%02d",sec/60,sec%60),x+2*density,height*.09f,paint)
+        }
     }
-    override fun onTouchEvent(event: MotionEvent): Boolean { val callback = seek ?: return false; if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE || event.action == MotionEvent.ACTION_UP) { callback((event.x/width*duration).toInt().coerceIn(0,duration)); return true }; return true }
+    private var lastX=0f
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val callback=seek ?: return false
+        when(event.action) {
+            MotionEvent.ACTION_DOWN -> { lastX=event.x; parent.requestDisallowInterceptTouchEvent(true); return true }
+            MotionEvent.ACTION_MOVE -> { val delta=((lastX-event.x)*40f/(3*resources.displayMetrics.density)).toInt(); cursor=(cursor+delta).coerceIn(0,duration); lastX=event.x; callback(cursor); invalidate(); return true }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { parent.requestDisallowInterceptTouchEvent(false); return true }
+        }; return true
+    }
 }

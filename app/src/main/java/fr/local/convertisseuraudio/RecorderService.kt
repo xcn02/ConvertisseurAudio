@@ -18,6 +18,7 @@ class RecorderService : Service() {
         const val ACTION_STATE = "fr.local.convertisseuraudio.STATE"
         const val EXTRA_STATE = "state"
         @Volatile var state = "idle"
+        @Volatile var routeLabel = "Source non vérifiée"
         @Volatile var seconds = 0L
         @Volatile var amplitude = 0
         val peaks = ArrayList<Int>()
@@ -49,7 +50,10 @@ class RecorderService : Service() {
                 if (limitSeconds > 0L && seconds >= limitSeconds) { stopRecording(); return }
                 amplitude = if (state == "recording") (recorder?.runCatching { maxAmplitude }?.getOrNull() ?: 0) else 0
                 recordedMs = accumulated + if (state == "recording") SystemClock.elapsedRealtime() - segmentStart else 0L
-                if (state == "recording") peaks.add(amplitude)
+                if (state == "recording") {
+                    peaks.add(amplitude)
+                    if(Build.VERSION.SDK_INT >= 28) routeLabel = runCatching { recorder?.routedDevice?.let { "Microphone : ${when(it.type) { AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Téléphone"; AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth"; AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET -> "Casque filaire"; else -> it.productName.toString() }}" } }.getOrNull() ?: "Source non vérifiée"
+                }
                 handler.postDelayed(this, 40)
             }
         }
@@ -57,7 +61,7 @@ class RecorderService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
-        val channel = NotificationChannel(CHANNEL_ID, "Enregistrement audio", NotificationManager.IMPORTANCE_LOW)
+        val channel = NotificationChannel(CHANNEL_ID, "Enregistrement audio", NotificationManager.IMPORTANCE_LOW).apply { setSound(null,null); enableVibration(false) }
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         callback = object : AudioDeviceCallback() {
@@ -104,6 +108,18 @@ class RecorderService : Service() {
             val media = MediaRecorder()
             recorder = media
             media.setAudioSource(MediaRecorder.AudioSource.MIC)
+            routeLabel = "Source non vérifiée"
+            val source = prefs.getString("mic_source","auto")
+            if(source != "auto") {
+                check(Build.VERSION.SDK_INT >= 28) { "Sélection du microphone : Android 9 minimum" }
+                val types = when(source) {
+                    "internal" -> setOf(AudioDeviceInfo.TYPE_BUILTIN_MIC)
+                    "wired" -> setOf(AudioDeviceInfo.TYPE_WIRED_HEADSET,AudioDeviceInfo.TYPE_USB_HEADSET)
+                    else -> setOf(AudioDeviceInfo.TYPE_BLUETOOTH_SCO,AudioDeviceInfo.TYPE_BLE_HEADSET)
+                }
+                val device=audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.type in types } ?: error("Microphone choisi indisponible")
+                check(media.setPreferredDevice(device)) { "Sélection du microphone refusée" }
+            }
             media.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             media.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             media.setAudioChannels(1)

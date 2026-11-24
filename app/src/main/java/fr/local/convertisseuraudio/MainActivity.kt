@@ -55,14 +55,20 @@ class MainActivity : Activity() {
         }
     }
     private var status: TextView? = null
+    private var timerText: TextView? = null
+    private var routeText: TextView? = null
     private var pauseButton: Button? = null
     private var waveform: WaveformView? = null
     private val uiHandler = Handler(Looper.getMainLooper())
     private val meterTick = object : Runnable { override fun run() { if (page == "audio") { updateRecorderControls(); waveform?.live(RecorderService.peaks, RecorderService.recordedMs); uiHandler.postDelayed(this, 40) } } }
     private var startButton: Button? = null
-    private val colors = intArrayOf(0xff152238.toInt(), 0xff536174.toInt())
+    private val dark get() = resources.configuration.uiMode and 0x30 == 0x20
+    private val colors get() = if (dark) intArrayOf(0xffE4E8EF.toInt(), 0xffADB8C8.toInt()) else intArrayOf(0xff263244.toInt(), 0xff596579.toInt())
+    private val accent get() = if (dark) 0xffA9BADA.toInt() else 0xff596B8D.toInt()
+    private val surface get() = if (dark) 0xff252B35.toInt() else 0xffFFFFFF.toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        setTheme(if (dark) R.style.AppThemeDark else R.style.AppTheme)
         super.onCreate(savedInstanceState)
         // Protects screen content in recent-app previews and screenshots.
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -95,7 +101,7 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
-        when (page) { "converter" -> super.onBackPressed(); "settings" -> renderConverter(); "audio" -> showSettings(); "audio_settings" -> showAudio(); "files" -> showAudio(); "player" -> { player?.release(); player = null; showFiles() }; else -> renderConverter() }
+        when (page) { "converter" -> super.onBackPressed(); "settings" -> renderConverter(); "audio" -> showSettings(); "audio_settings" -> showAudio(); "files" -> { selected.clear(); if(trashMode) { trashMode=false; showFiles() } else showAudio() }; "player" -> { player?.release(); player = null; showFiles() }; else -> renderConverter() }
     }
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun text(s: String, size: Float = 16f, bold: Boolean = false): TextView = TextView(this).apply {
@@ -103,13 +109,13 @@ class MainActivity : Activity() {
     }
     private fun button(label: String, f: () -> Unit): Button = Button(this).apply {
         text = label; isAllCaps = false; textSize = 15f
-        setTextColor(0xff17305D.toInt()); backgroundTintList = android.content.res.ColorStateList.valueOf(0xffE1E9FA.toInt())
+        setTextColor(colors[0]); backgroundTintList = android.content.res.ColorStateList.valueOf(if (dark) 0xff384353.toInt() else 0xffE5EAF2.toInt())
         setPadding(dp(8),dp(8),dp(8),dp(8)); setOnClickListener { f() }
     }
     private fun card(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL; setPadding(dp(18),dp(16),dp(18),dp(16))
-        background = android.graphics.drawable.GradientDrawable().apply { setColor(0xffffffff.toInt()); cornerRadius = dp(22).toFloat() }
-        elevation = dp(2).toFloat()
+        background = android.graphics.drawable.GradientDrawable().apply { setColor(surface); cornerRadius = dp(22).toFloat() }
+        elevation = 0f
     }
     private fun cardAdd(view: View) { root.addView(view, LinearLayout.LayoutParams(-1,-2).apply { bottomMargin = dp(14) }) }
 
@@ -144,7 +150,7 @@ class MainActivity : Activity() {
     }
     private fun renderConverter() {
         uiHandler.removeCallbacks(meterTick); waveform = null
-        page = "converter"; screen("Convertisseur", "Toutes vos unités, au même endroit")
+        page = "converter"; screen("Convertisseur")
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         top.addView(text("Conversions", 19f, true), LinearLayout.LayoutParams(0,-2,1f))
         top.addView(button("⋮") { showSettings() }, LinearLayout.LayoutParams(dp(58),dp(48)))
@@ -166,9 +172,10 @@ class MainActivity : Activity() {
         fun calculate() {
             val n = source.text.toString().replace(',', '.').toDoubleOrNull()
             if (n == null) { answer.text = "Saisissez un nombre"; return }
-            val category = categoryNames[cat.selectedItemPosition]
+            val category = categoryNames.getOrNull(cat.selectedItemPosition) ?: return
             val units = categories.getValue(category)
             val left = from.selectedItem.toString(); val right = to.selectedItem.toString()
+            if(left !in units || right !in units) return
             val result = if (category == "Température") {
                 val kelvin = when (left) { "°C" -> n + 273.15; "°F" -> (n - 32) * 5.0 / 9 + 273.15; else -> n }
                 when (right) { "°C" -> kelvin - 273.15; "°F" -> (kelvin - 273.15) * 9.0 / 5 + 32; else -> kelvin }
@@ -177,7 +184,7 @@ class MainActivity : Activity() {
         }
         fun refreshUnits() {
             refreshing = true
-            val names = categories.getValue(categoryNames[cat.selectedItemPosition]).keys.toList()
+            val names = categories.getValue(categoryNames.getOrNull(cat.selectedItemPosition) ?: return).keys.toList()
             from.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
             to.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
             to.setSelection(if (names.size > 2) 2 else 1)
@@ -198,6 +205,7 @@ class MainActivity : Activity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = calculate()
             override fun afterTextChanged(s: Editable?) {}
         })
+        root.addView(button("Copier le résultat") { (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Conversion",answer.text)) })
         root.addView(button("⇄  Inverser les unités") {
             val a = from.selectedItemPosition; from.setSelection(to.selectedItemPosition); to.setSelection(a); calculate()
         })
@@ -210,31 +218,50 @@ class MainActivity : Activity() {
         root.addView(button("Enregistreur audio  ›") { showAudio() })
         heading("Application")
         root.addView(text("Stockage local uniquement. Pas de connexion réseau, compte ou suivi publicitaire."))
-        root.addView(text("Version 0.6.0 • Projet de développement", 13f))
+        root.addView(text("Version 0.7.0", 13f))
+    }
+    private fun toolbar(back: () -> Unit, action: String, next: () -> Unit) {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(button("‹ Retour", back)); row.addView(Space(this), LinearLayout.LayoutParams(0,1,1f)); row.addView(button(action,next)); root.addView(row)
+    }
+    private fun controls(vararg views: View) {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        views.forEach { row.addView(it, LinearLayout.LayoutParams(0,dp(64),1f).apply { marginStart=dp(3); marginEnd=dp(3) }) }; root.addView(row)
+    }
+    private fun primary(label: String, action: () -> Unit): Button = button(label,action).apply {
+        background = android.graphics.drawable.GradientDrawable().apply { shape=android.graphics.drawable.GradientDrawable.OVAL; setColor(accent) }
+        backgroundTintList=null; setTextColor(if(dark) 0xff182235.toInt() else -1); textSize=26f
     }
     private fun showAudio() {
         page = "audio"; screen("Enregistreur audio")
-        root.addView(button("← Paramètres") { showSettings() })
-        heading("Enregistrement")
-        status = text("", 22f, true).also { root.addView(it) }
-        waveform = WaveformView(this).also { cardAdd(it) }
-        startButton = button("● Démarrer") { startRecording() }.also { root.addView(it) }
-        pauseButton = button("Pause") {
-            sendAction(if (RecorderService.state == "paused") RecorderService.ACTION_RESUME else RecorderService.ACTION_PAUSE)
-            Handler(Looper.getMainLooper()).postDelayed({ updateRecorderControls() }, 200)
-        }.also { root.addView(it) }
-        root.addView(button("■ Arrêter et sauvegarder") { sendAction(RecorderService.ACTION_STOP); Handler(Looper.getMainLooper()).postDelayed({ updateRecorderControls() }, 300) })
-        root.addView(button("Ouvrir les enregistrements ›") { showFiles() })
-        updateRecorderControls()
-
-        root.addView(button("⚙  Réglages de l’enregistreur") { showAudioSettings() })
+        toolbar({showSettings()}, "⚙ Réglages", {showAudioSettings()})
+        space(30)
+        status = text("", 15f).apply { gravity=Gravity.CENTER }.also { root.addView(it) }
+        timerText = text("00:00,00", 44f, true).apply { gravity=Gravity.CENTER; typeface=android.graphics.Typeface.MONOSPACE }.also { root.addView(it) }
+        routeText = text("", 13f).apply { gravity=Gravity.CENTER }.also { root.addView(it) }
+        waveform = WaveformView(this).also { root.addView(it, LinearLayout.LayoutParams(-1,-2)) }
+        space(32)
+        val row = LinearLayout(this).apply { orientation=LinearLayout.HORIZONTAL; gravity=Gravity.CENTER }
+        row.addView(button("Fichiers") { showFiles() },LinearLayout.LayoutParams(0,dp(52),1f))
+        startButton=primary("●") { if(RecorderService.state=="idle") startRecording() else sendAction(RecorderService.ACTION_STOP) }.also { row.addView(it,LinearLayout.LayoutParams(dp(76),dp(76)).apply { marginStart=dp(12); marginEnd=dp(12) }) }
+        pauseButton=button("Pause") { sendAction(if(RecorderService.state=="paused") RecorderService.ACTION_RESUME else RecorderService.ACTION_PAUSE) }.also { row.addView(it,LinearLayout.LayoutParams(0,dp(52),1f)) }
+        root.addView(row); updateRecorderControls()
         uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick)
     }
     private fun showAudioSettings() {
         uiHandler.removeCallbacks(meterTick); waveform = null
         page = "audio_settings"; screen("Réglages audio", "Paramètres appliqués à la prochaine session")
         root.addView(button("← Enregistreur") { showAudio() })
-        heading("Durée maximale")
+        heading("Enregistrement")
+        root.addView(text("Source audio", 15f))
+        val sources = listOf("auto", "internal", "wired", "bluetooth")
+        val mic = spinner(listOf("Automatique", "Microphone du téléphone", "Casque filaire", "Microphone Bluetooth"), sources.indexOf(prefs.getString("mic_source", "auto")).coerceAtLeast(0))
+        root.addView(mic)
+        mic.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { prefs.edit().putString("mic_source",sources[position]).apply() }
+        }
+        root.addView(text("Durée maximale", 15f))
         val choices = listOf("Sans limite", "1 minute", "2 minutes", "3 minutes", "5 minutes", "10 minutes", "15 minutes", "30 minutes", "Personnalisée (minutes)")
         val limits = listOf(0L, 60L, 120L, 180L, 300L, 600L, 900L, 1800L)
         val saved = prefs.getLong("limit_seconds", 180L)
@@ -250,7 +277,7 @@ class MainActivity : Activity() {
             if (secs == null) Toast.makeText(this, "Durée invalide", Toast.LENGTH_SHORT).show()
             else { prefs.edit().putLong("limit_seconds", secs).apply(); Toast.makeText(this, "Durée mémorisée pour la prochaine session", Toast.LENGTH_SHORT).show() }
         })
-        heading("Minuteur")
+        root.addView(text("Comportement du minuteur",15f))
         val modes = listOf("Temps effectivement enregistré", "Temps écoulé, pauses comprises")
         val timer = spinner(modes, if (prefs.getString("timer_mode", "record") == "elapsed") 1 else 0)
         root.addView(timer)
@@ -258,7 +285,7 @@ class MainActivity : Activity() {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) { prefs.edit().putString("timer_mode", if (position == 0) "record" else "elapsed").apply() }
         }
-        heading("Commandes rapides")
+        heading("Périphériques et commandes")
         val quickStop = CheckBox(this).apply {
             text = "Double appui Volume − : arrêter et sauvegarder"
             isChecked = prefs.getBoolean("quick_stop_volume", false)
@@ -270,7 +297,7 @@ class MainActivity : Activity() {
         root.addView(quickStop)
         heading("Stockage")
         root.addView(text(if (Build.VERSION.SDK_INT >= 29) "Nouveaux enregistrements : Music/Convertisseur/Recordings. Un seul original, accessible dans le gestionnaire de fichiers." else "Stockage interne sur Android 8 et 9 ; export manuel disponible.", 14f))
-        heading("Écouteurs et périphériques")
+        heading("Règles de connexion")
         rule("Jack : débranchement", "jack_off", "pause")
         rule("Jack : branchement", "jack_on", "none")
         rule("Bluetooth : déconnexion", "bt_off", "pause")
@@ -287,11 +314,14 @@ class MainActivity : Activity() {
     private fun updateRecorderControls() {
         val state = RecorderService.state
         status?.text = when (state) {
-            "recording" -> "● Enregistrement : ${formatTime(RecorderService.recordedMs)}"
-            "paused" -> "Ⅱ En pause : ${formatTime(RecorderService.recordedMs)}"
+            "recording" -> "Enregistrement en cours"
+            "paused" -> "En pause"
             else -> "Prêt à enregistrer"
         }
-        startButton?.isEnabled = state == "idle"
+        timerText?.text = formatTime(if(state=="idle") 0L else RecorderService.recordedMs)
+        routeText?.text = if(state=="idle") "" else RecorderService.routeLabel
+        startButton?.text = if(state=="idle") "●" else "■"
+        startButton?.contentDescription = if(state=="idle") "Démarrer l’enregistrement" else "Arrêter et sauvegarder"
         pauseButton?.isEnabled = state != "idle"
         pauseButton?.text = if (state == "paused") "Reprendre" else "Pause"
     }
@@ -311,50 +341,69 @@ class MainActivity : Activity() {
         val intent = Intent(this, RecorderService::class.java).setAction(action)
         if (action == RecorderService.ACTION_START) startForegroundService(intent) else startService(intent)
     }
+    private val selected = linkedSetOf<String>()
+    private var trashMode = false
+    private fun shareFiles(files: List<AudioStorage.Recording>) {
+        if(files.isEmpty()) return
+        val uris = ArrayList(files.mapNotNull { it.uri })
+        if(uris.size != files.size) {
+            if(files.size != 1) { Toast.makeText(this,"Export groupé indisponible pour ces fichiers internes",Toast.LENGTH_SHORT).show(); return }
+            pendingExport=files.first(); startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type="audio/mp4"; putExtra(Intent.EXTRA_TITLE,files.first().name) },101); return
+        }
+        val intent=Intent(if(uris.size==1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE).apply {
+            type="audio/mp4"; addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if(uris.size==1) putExtra(Intent.EXTRA_STREAM,uris.first()) else putParcelableArrayListExtra(Intent.EXTRA_STREAM,uris)
+            clipData=ClipData.newRawUri("Audio",uris.first()).apply { uris.drop(1).forEach { addItem(ClipData.Item(it)) } }
+        }; startActivity(Intent.createChooser(intent,"Partager"))
+    }
+    private fun fileAction(files: List<AudioStorage.Recording>, restore: Boolean = false) {
+        if(files.isEmpty()) return
+        val permanent = trashMode && !restore
+        android.app.AlertDialog.Builder(this).setTitle(if(restore) "Restaurer ?" else if(permanent) "Supprimer définitivement ?" else "Retirer les fichiers ?")
+            .setMessage(if(!restore && !permanent) "Corbeille sur Android 11 et ultérieur pour les fichiers partagés ; suppression définitive sinon." else "${files.size} fichier(s)")
+            .setNegativeButton("Annuler",null).setPositiveButton("Confirmer") { _,_ ->
+                val failures=files.count { f -> !runCatching { if(restore) f.trash(this,false) else if(!permanent && Build.VERSION.SDK_INT>=30 && f.uri!=null) f.trash(this,true) else f.delete(this) }.getOrDefault(false) }
+                if(failures>0) Toast.makeText(this,"$failures opération(s) impossible(s)",Toast.LENGTH_LONG).show()
+                selected.clear(); showFiles()
+            }.show()
+    }
     private fun showFiles() {
-        page = "files"; screen("Enregistrements", "Fichiers M4A stockés uniquement sur cet appareil")
-        root.addView(button("← Enregistreur") { showAudio() })
-        val files = runCatching { AudioStorage.list(this) }.getOrElse { root.addView(text("Bibliothèque inaccessible")); return }
-        if (files.isEmpty()) { root.addView(text("Aucun fichier enregistré.")); return }
+        uiHandler.removeCallbacks(meterTick); waveform=null
+        page = "files"; screen(if(trashMode) "Corbeille" else "Enregistrements")
+        toolbar({ selected.clear(); if(trashMode) { trashMode=false; showFiles() } else showAudio() }, if(trashMode) "Bibliothèque" else "Corbeille", { selected.clear(); trashMode=!trashMode; showFiles() })
+        val files = runCatching { AudioStorage.list(this,trashMode) }.getOrElse { root.addView(text("Bibliothèque inaccessible")); return }
+        if(selected.isNotEmpty()) {
+            val chosen=files.filter { it.key in selected }
+            controls(button("Annuler") { selected.clear(); showFiles() },button(if(trashMode) "Restaurer" else "Partager") { if(trashMode) fileAction(chosen,true) else shareFiles(chosen) },button("Supprimer") { fileAction(chosen) })
+        }
+        if(files.isEmpty()) root.addView(text("Aucun fichier."))
+        val dates=java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT,java.text.DateFormat.SHORT)
         files.forEach { file ->
-            heading(file.title.replace('_', ' '))
-            root.addView(text("${file.size / 1024L} Ko", 13f))
-            root.addView(button("▶ Écouter") { showPlayer(file) })
-            root.addView(button("Renommer") {
-                val input = field(file.title)
-                android.app.AlertDialog.Builder(this).setTitle("Renommer").setView(input).setNegativeButton("Annuler", null).setPositiveButton("OK") { _, _ ->
-                    val name = input.text.toString().trim()
-                    if (runCatching { file.rename(this, name) }.getOrDefault(false)) showFiles()
-                    else Toast.makeText(this, "Renommage impossible", Toast.LENGTH_SHORT).show()
-                }.show()
-            })
-            root.addView(button("Partager / exporter le fichier") {
-                if (file.uri != null) {
-                    val share = Intent(Intent.ACTION_SEND).apply { type = "audio/mp4"; putExtra(Intent.EXTRA_STREAM, file.uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION); clipData = ClipData.newRawUri(file.name, file.uri) }
-                    startActivity(Intent.createChooser(share, "Partager l’enregistrement")); return@button
+            val row=LinearLayout(this).apply { orientation=LinearLayout.HORIZONTAL; gravity=Gravity.CENTER_VERTICAL; setPadding(0,dp(7),0,dp(7)) }
+            val toggle={ if(!selected.add(file.key)) selected.remove(file.key); showFiles() }
+            if(selected.isNotEmpty()) row.addView(CheckBox(this).apply { isChecked=file.key in selected; setOnClickListener { toggle() } })
+            val details=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; addView(text(file.title.replace('_',' '),16f,true)); addView(text("${dates.format(java.util.Date(file.modified))} · ${file.size/1024} Ko",12f)); setOnClickListener { if(selected.isNotEmpty() || trashMode) toggle() else showPlayer(file) }; setOnLongClickListener { toggle(); true } }
+            row.addView(details,LinearLayout.LayoutParams(0,-2,1f))
+            if(!trashMode && selected.isEmpty()) row.addView(button("▶") { showPlayer(file) },LinearLayout.LayoutParams(dp(48),dp(48)))
+            row.addView(button("⋮") { val menu=if(trashMode) arrayOf("Restaurer","Supprimer définitivement") else arrayOf("Renommer","Partager","Supprimer","Sélectionner"); android.app.AlertDialog.Builder(this).setItems(menu) { _,i ->
+                if(trashMode) fileAction(listOf(file),i==0) else when(i) {
+                    0 -> { val input=field(file.title); android.app.AlertDialog.Builder(this).setTitle("Renommer").setView(input).setNegativeButton("Annuler",null).setPositiveButton("OK") { _,_ -> if(runCatching { file.rename(this,input.text.toString().trim()) }.getOrDefault(false)) showFiles() else Toast.makeText(this,"Renommage impossible",Toast.LENGTH_SHORT).show() }.show() }
+                    1 -> shareFiles(listOf(file)); 2 -> fileAction(listOf(file)); 3 -> toggle()
                 }
-                // No FileProvider dependency: use document export through ACTION_CREATE_DOCUMENT.
-                pendingExport = file
-                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "audio/mp4"; putExtra(Intent.EXTRA_TITLE, file.name) }
-                @Suppress("DEPRECATION") startActivityForResult(intent, 101)
-            })
-            root.addView(button("Supprimer") {
-                android.app.AlertDialog.Builder(this).setTitle("Supprimer ce fichier ?")
-                    .setMessage(file.name).setNegativeButton("Annuler", null)
-                    .setPositiveButton("Supprimer") { _, _ -> if (runCatching { file.delete(this) }.getOrDefault(false)) { showFiles() } else Toast.makeText(this, "Suppression impossible", Toast.LENGTH_SHORT).show() }.show()
-            })
+            }.show() },LinearLayout.LayoutParams(dp(48),dp(48)))
+            root.addView(row); root.addView(View(this).apply { setBackgroundColor(if(dark) 0xff39404B.toInt() else 0xffE2E6ED.toInt()) },LinearLayout.LayoutParams(-1,dp(1)))
         }
     }
     private fun formatTime(ms: Long): String = String.format(Locale.FRANCE, "%02d:%02d,%02d", ms / 60000, ms / 1000 % 60, ms / 10 % 100)
     private fun showPlayer(file: AudioStorage.Recording) {
         player?.release(); player = null
         page = "player"; screen(file.title)
-        root.addView(button("← Bibliothèque") { player?.release(); player = null; showFiles() })
+        toolbar({player?.release(); player=null; showFiles()}, "Partager", { shareFiles(listOf(file)) })
         val media = try { MediaPlayer().apply { if (file.uri != null) setDataSource(this@MainActivity, file.uri) else setDataSource(file.file!!.absolutePath); prepare() } } catch (_: Exception) { root.addView(text("Lecture impossible")); return }
         player = media
         val duration = media.duration.coerceAtLeast(1)
-        val time = text("", 30f, true).also { root.addView(it) }
-        val wave = WaveformView(this).also { cardAdd(it) }
+        val time = text("", 32f, true).apply { gravity=Gravity.CENTER }.also { root.addView(it) }
+        val wave = WaveformView(this).also { root.addView(it) }
         wave.playback(emptyList(), duration, 0) { media.seekTo(it) }
         Thread {
             val peaks = AudioStorage.decodePeaks(this, file)
@@ -365,9 +414,8 @@ class MainActivity : Activity() {
             override fun onStartTrackingTouch(bar: SeekBar?) {}
             override fun onStopTrackingTouch(bar: SeekBar?) {}
         }) }; root.addView(seek)
-        val play = button("Lecture / Pause") { if (media.isPlaying) media.pause() else media.start() }; root.addView(play)
-        root.addView(button("−10 secondes") { media.seekTo((media.currentPosition - 10000).coerceAtLeast(0)) })
-        root.addView(button("+10 secondes") { media.seekTo((media.currentPosition + 10000).coerceAtMost(duration)) })
+        val play = primary("▶") { if (media.isPlaying) media.pause() else media.start() }
+        controls(button("−10 s") { media.seekTo((media.currentPosition - 10000).coerceAtLeast(0)) },play,button("+10 s") { media.seekTo((media.currentPosition + 10000).coerceAtMost(duration)) })
         val speeds = listOf(.5f, .75f, 1f, 1.25f, 1.5f, 2f)
         val speed = spinner(speeds.map { "×$it" }, 2); root.addView(speed)
         speed.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -376,7 +424,7 @@ class MainActivity : Activity() {
         }
         uiHandler.post(object : Runnable { override fun run() {
             if (player !== media || page != "player") return
-            val current = media.currentPosition; time.text = formatTime(current.toLong()) + " / " + formatTime(duration.toLong()); seek.progress = current; wave.position(current); uiHandler.postDelayed(this, 40)
+            play.text = if(media.isPlaying) "Ⅱ" else "▶"; val current = media.currentPosition; time.text = formatTime(current.toLong()) + " / " + formatTime(duration.toLong()); seek.progress = current; wave.position(current); uiHandler.postDelayed(this, 40)
         } })
     }
     private var pendingExport: AudioStorage.Recording? = null
