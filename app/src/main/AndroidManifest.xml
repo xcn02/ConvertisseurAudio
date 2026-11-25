@@ -15,5 +15,18 @@
             </intent-filter>
         </activity>
         <service android:name=".RecorderService" android:exported="false" android:foregroundServiceType="microphone" android:stopWithTask="false" />
-    </application>
+  <service
+            android:name=".QuickStopService"
+            android:exported="true"
+            android:label="@string/quick_stop_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/quick_stop" />
+        </service>
+
+  </application>
 </manifest>

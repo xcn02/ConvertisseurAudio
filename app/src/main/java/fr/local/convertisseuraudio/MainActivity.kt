@@ -79,6 +79,22 @@ class MainActivity : Activity() {
             }
         }
     }
+    private val screenReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (RecorderService.state == "idle" || !prefs.getBoolean("hide_on_lock", true)) return
+            // Léger différé : laisse le verrouillage s'installer avant de sortir la tâche.
+            uiHandler.postDelayed({ if (!isFinishing && RecorderService.state != "idle") finishAndRemoveTask() }, 500)
+        }
+    }
+    private val closeReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            uiHandler.postDelayed({ if (!isFinishing) finishAndRemoveTask() }, 250)
+        }
+    }
+    private fun registerLocal(filter: String, r: android.content.BroadcastReceiver) {
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(r, IntentFilter(filter), RECEIVER_NOT_EXPORTED)
+        else @Suppress("DEPRECATION") registerReceiver(r, IntentFilter(filter))
+    }
     private var status: TextView? = null
     private var timerText: TextView? = null
     private var routeText: TextView? = null
@@ -97,27 +113,26 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         // Protects screen content in recent-app previews and screenshots.
         applyPrivacy()
+        registerLocal(Intent.ACTION_SCREEN_OFF, screenReceiver)
+        registerLocal(RecorderService.ACTION_CLOSE, closeReceiver)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 22)
         renderConverter()
     }
     override fun onStart() { super.onStart(); if (page == "audio") { uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick) }; if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE), RECEIVER_NOT_EXPORTED) else @Suppress("DEPRECATION") registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE)) }
     override fun onStop() { uiHandler.removeCallbacks(meterTick); super.onStop(); unregisterReceiver(receiver) }
-    override fun onDestroy() { releasePlayer(); uiHandler.removeCallbacksAndMessages(null); super.onDestroy() }
+    override fun onDestroy() { releasePlayer(); runCatching { unregisterReceiver(screenReceiver); unregisterReceiver(closeReceiver) }; uiHandler.removeCallbacksAndMessages(null); super.onDestroy() }
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        // This shortcut only works while the recorder screen is in the foreground.
-        // Never intercept hardware keys when the app is backgrounded or the screen is locked.
+        // Fonctionne sur n'importe quelle page ; écran verrouillé, voir QuickStopService / la MediaSession.
         val enabled = prefs.getBoolean("quick_stop_volume", false)
         val active = RecorderService.state == "recording" || RecorderService.state == "paused"
-        if (enabled && page == "audio" && active && event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+        if (enabled && active && event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
                 val now = SystemClock.elapsedRealtime()
                 if (lastVolumeDownMs != 0L && now - lastVolumeDownMs <= volumeDoublePressWindowMs) {
                     lastVolumeDownMs = 0L
-                    sendAction(RecorderService.ACTION_STOP)
-                } else {
-                    lastVolumeDownMs = now
-                }
+                    sendAction(RecorderService.ACTION_STOP_AND_CLOSE)
+                } else lastVolumeDownMs = now
             }
             return true
         }
@@ -333,6 +348,22 @@ class MainActivity : Activity() {
             }
         }
         root.addView(quickStop)
+        root.addView(CheckBox(this).apply {
+            text = "Quitter l’application au verrouillage de l’écran pendant un enregistrement"
+            isChecked = prefs.getBoolean("hide_on_lock", true)
+            setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean("hide_on_lock", v).apply() }
+        })
+        val am = getSystemService(ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager
+        val accessibilityOn = am.getEnabledAccessibilityServiceList(
+            android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK
+        ).any { it.resolveInfo.serviceInfo.packageName == packageName }
+        root.addView(text(
+            if (accessibilityOn) "Double appui hors application : actif (service d’accessibilité autorisé)."
+            else "Double appui écran verrouillé : nécessite le service d’accessibilité ci-dessous. Sans lui, l’appui ne fonctionne qu’application ouverte.",
+            13f))
+        root.addView(button(if (accessibilityOn) "Réglages d’accessibilité" else "Activer le double appui hors application") {
+            startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        })
         heading("Stockage")
         root.addView(text(if (Build.VERSION.SDK_INT >= 29) "Nouveaux enregistrements : Music/Convertisseur/Recordings. Un seul original, accessible dans le gestionnaire de fichiers." else "Stockage interne sur Android 8 et 9 ; export manuel disponible.", 14f))
         heading("Règles de connexion")

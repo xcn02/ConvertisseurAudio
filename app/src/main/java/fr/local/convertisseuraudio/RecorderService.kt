@@ -4,6 +4,8 @@ import android.app.*
 import android.content.*
 import android.content.pm.ServiceInfo
 import android.media.*
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.*
 import java.io.File
 import java.text.SimpleDateFormat
@@ -15,6 +17,8 @@ class RecorderService : Service() {
         const val ACTION_PAUSE = "fr.local.convertisseuraudio.PAUSE"
         const val ACTION_RESUME = "fr.local.convertisseuraudio.RESUME"
         const val ACTION_STOP = "fr.local.convertisseuraudio.STOP"
+        const val ACTION_STOP_AND_CLOSE = "fr.local.convertisseuraudio.STOP_AND_CLOSE"
+        const val ACTION_CLOSE = "fr.local.convertisseuraudio.CLOSE"
         const val ACTION_STATE = "fr.local.convertisseuraudio.STATE"
         const val EXTRA_STATE = "state"
         @Volatile var state = "idle"
@@ -26,10 +30,61 @@ class RecorderService : Service() {
         const val CHANNEL_ID = "audio_recording"
         const val NOTIF_ID = 1024
         fun folder(context: Context): File = File(context.filesDir, "audio").apply { mkdirs() }
+        fun stopAndClose(context: Context) {
+            if (state == "idle") {
+                context.sendBroadcast(Intent(ACTION_CLOSE).setPackage(context.packageName)); return
+            }
+            context.startService(Intent(context, RecorderService::class.java).setAction(ACTION_STOP_AND_CLOSE))
+        }
     }
     private var recorder: MediaRecorder? = null
     private var routingBluetooth = false
     private var previousMode = AudioManager.MODE_NORMAL
+    private var session: MediaSession? = null
+    private var lastVolumeDown = 0L
+    private var lastShownSecond = -1L
+    private val volumeProvider = object : VolumeProvider(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, 100, 50) {
+        override fun onVolumeUp() = bump(1)
+        override fun onVolumeDown() = bump(-1)
+    }
+    private fun bump(direction: Int) {
+        val value = (volumeProvider.currentVolume + direction).coerceIn(0, 100)
+        volumeProvider.setCurrentVolume(value)
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val steps = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(value / 100f * steps), 0)
+        if (direction < 0) quickStop()
+    }
+    private fun quickStop() {
+        val now = SystemClock.elapsedRealtime()
+        if (lastVolumeDown != 0L && now - lastVolumeDown <= 650L) { lastVolumeDown = 0L; stopAndClose(this) }
+        else lastVolumeDown = now
+    }
+    private fun accessibilityActive(): Boolean =
+        (getSystemService(ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager)
+            .getEnabledAccessibilityServiceList(android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .any { it.resolveInfo.serviceInfo.packageName == packageName }
+    private fun ensureSession() {
+        if (session != null || accessibilityActive()) return
+        if (!getSharedPreferences("settings", MODE_PRIVATE).getBoolean("quick_stop_volume", false)) return
+        session = MediaSession(this, "convertisseur-recorder").apply {
+            setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
+            setPlaybackToRemote(volumeProvider)
+            setCallback(object : MediaSession.Callback() {
+                override fun onPlay() { if (state == "paused") resumeRecording() else if (state == "idle") startRecording() }
+                override fun onPause() { pauseRecording() }
+                override fun onStop() { stopRecording() }
+            })
+            setPlaybackState(PlaybackState.Builder().setState(PlaybackState.STATE_PLAYING, 0L, 1f).build())
+            isActive = true
+        }
+    }
+    private fun setSessionState(st: Int) {
+        session?.setPlaybackState(PlaybackState.Builder().setState(st, recordedMs, 1f).build())
+        session?.isActive = true
+    }
+    private fun releaseSession() { session?.runCatching { isActive = false; release() }; session = null }
+
     private fun clearBluetooth() {
         if(!routingBluetooth) return
         routingBluetooth=false
@@ -55,7 +110,7 @@ class RecorderService : Service() {
             } })
         } catch(e:Exception) { bluetoothFailure(e.localizedMessage ?: "Connexion Bluetooth impossible") }
     }
-    private fun bluetoothFailure(message:String) { clearBluetooth(); state="idle"; broadcastState(message); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+    private fun bluetoothFailure(message:String) { clearBluetooth(); state="idle"; releaseSession(); broadcastState(message); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
 
     private var target: File? = null
     private var sharedTarget: android.net.Uri? = null
@@ -79,6 +134,7 @@ class RecorderService : Service() {
                 if (limitSeconds > 0L && seconds >= limitSeconds) { stopRecording(); return }
                 amplitude = if (state == "recording") (recorder?.runCatching { maxAmplitude }?.getOrNull() ?: 0) else 0
                 recordedMs = accumulated + if (state == "recording") SystemClock.elapsedRealtime() - segmentStart else 0L
+                if (state != "connecting" && seconds != lastShownSecond) { lastShownSecond = seconds; promote() }
                 if (state == "recording") {
                     peaks.add(amplitude)
                     if(Build.VERSION.SDK_INT >= 28) routeLabel = runCatching { recorder?.routedDevice?.let { "Microphone : ${when(it.type) { AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Téléphone"; AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth"; AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET -> "Casque filaire"; else -> it.productName.toString() }}" } }.getOrNull() ?: "Source non vérifiée"
@@ -120,6 +176,7 @@ class RecorderService : Service() {
             ACTION_PAUSE -> pauseRecording()
             ACTION_RESUME -> resumeRecording()
             ACTION_STOP -> stopRecording()
+            ACTION_STOP_AND_CLOSE -> { stopRecording(); sendBroadcast(Intent(ACTION_CLOSE).setPackage(packageName)) }
         }
         return START_NOT_STICKY
     }
@@ -128,7 +185,7 @@ class RecorderService : Service() {
         if(prefs.getString("mic_source","auto")=="bluetooth" && !bluetoothReady) { prepareBluetooth(); return }
         limitSeconds = prefs.getLong("limit_seconds", 180L)
         timerMode = prefs.getString("timer_mode", "record") ?: "record"
-        seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear()
+        seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear(); lastShownSecond = -1L; lastVolumeDown = 0L
         val name = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.US).format(Date()) + ".m4a"
         target = null; sharedTarget = null
         try {
@@ -170,6 +227,7 @@ class RecorderService : Service() {
             wallStart = SystemClock.elapsedRealtime()
             segmentStart = wallStart
             state = "recording"
+            ensureSession()
             handler.removeCallbacks(clock)
             handler.post(clock)
             promote()
@@ -178,7 +236,7 @@ class RecorderService : Service() {
             recorder?.runCatching { release() }
             recorder = null
             finalizeTarget(false)
-            clearBluetooth(); state = "idle"
+            clearBluetooth(); state = "idle"; releaseSession()
             broadcastState("Impossible de démarrer : ${e.localizedMessage}")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -190,6 +248,7 @@ class RecorderService : Service() {
             recorder?.pause()
             accumulated += SystemClock.elapsedRealtime() - segmentStart
             state = "paused"
+            setSessionState(PlaybackState.STATE_PAUSED)
             promote(); broadcastState()
         } catch (e: Exception) { stopRecording() }
     }
@@ -199,6 +258,7 @@ class RecorderService : Service() {
             recorder?.resume()
             segmentStart = SystemClock.elapsedRealtime()
             state = "recording"
+            setSessionState(PlaybackState.STATE_PLAYING)
             promote(); broadcastState()
         } catch (e: Exception) { stopRecording() }
     }
@@ -213,6 +273,7 @@ class RecorderService : Service() {
         finally { current?.runCatching { release() } }
         clearBluetooth(); valid = finalizeTarget(valid)
         state = "idle"; seconds = 0L; amplitude = 0
+        releaseSession()
         broadcastState(if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -237,15 +298,16 @@ class RecorderService : Service() {
     )
     private fun promote() {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val label = if(state=="connecting") "Connexion du microphone Bluetooth" else if (state == "paused") "Enregistrement en pause" else "Enregistrement audio en cours"
         val builder = Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_stat_audio)
-            .setContentTitle("Convertisseur · Audio")
-            .setContentText(label)
+            .setSmallIcon(R.drawable.ic_stat_dot)
+            .setContentTitle(if (state == "paused") "Enregistrement · pause" else if (state == "connecting") "Enregistrement · connexion" else "Enregistrement")
+            .setContentText(String.format(Locale.FRANCE, "%02d:%02d", recordedMs / 60000, recordedMs / 1000 % 60))
             .setShowWhen(false)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setVisibility(Notification.VISIBILITY_SECRET)
             .addAction(Notification.Action.Builder(null, "Arrêter", actionIntent(ACTION_STOP)).build())
         if (state == "paused") builder.addAction(Notification.Action.Builder(null, "Reprendre", actionIntent(ACTION_RESUME)).build())
         else builder.addAction(Notification.Action.Builder(null, "Pause", actionIntent(ACTION_PAUSE)).build())
@@ -264,7 +326,7 @@ class RecorderService : Service() {
             runCatching { recorder?.release() }; recorder = null
             finalizeTarget(valid)
         }
-        clearBluetooth(); state = "idle"
+        clearBluetooth(); state = "idle"; releaseSession()
         super.onDestroy()
     }
 }
