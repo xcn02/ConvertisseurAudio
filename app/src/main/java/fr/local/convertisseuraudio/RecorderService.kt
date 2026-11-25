@@ -43,7 +43,7 @@ class RecorderService : Service() {
     private var session: MediaSession? = null
     private var lastVolumeDown = 0L
     private var lastShownSecond = -1L
-    private val volumeProvider = object : VolumeProvider(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, 100, 50) {
+    private inner class RecorderVolumeProvider : VolumeProvider(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, 100, 50) {
         override fun onAdjustVolume(direction: Int) {
             when (direction) {
                 AudioManager.ADJUST_LOWER -> bump(-1)
@@ -52,10 +52,11 @@ class RecorderService : Service() {
         }
         override fun onSetVolumeTo(volume: Int) {
             val value = volume.coerceIn(0, 100)
-            volumeProvider.setCurrentVolume(value)
+            setCurrentVolume(value)
             applyStreamVolume(value)
         }
     }
+    private val volumeProvider = RecorderVolumeProvider()
     private fun applyStreamVolume(value: Int) {
         val am = getSystemService(AUDIO_SERVICE) as AudioManager
         val steps = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
