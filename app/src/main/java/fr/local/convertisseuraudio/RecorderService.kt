@@ -44,15 +44,27 @@ class RecorderService : Service() {
     private var lastVolumeDown = 0L
     private var lastShownSecond = -1L
     private val volumeProvider = object : VolumeProvider(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, 100, 50) {
-        override fun onVolumeUp() = bump(1)
-        override fun onVolumeDown() = bump(-1)
+        override fun onAdjustVolume(direction: Int) {
+            when (direction) {
+                AudioManager.ADJUST_LOWER -> bump(-1)
+                AudioManager.ADJUST_RAISE -> bump(1)
+            }
+        }
+        override fun onSetVolumeTo(volume: Int) {
+            val value = volume.coerceIn(0, 100)
+            volumeProvider.setCurrentVolume(value)
+            applyStreamVolume(value)
+        }
+    }
+    private fun applyStreamVolume(value: Int) {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val steps = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(value / 100f * steps), 0)
     }
     private fun bump(direction: Int) {
         val value = (volumeProvider.currentVolume + direction).coerceIn(0, 100)
         volumeProvider.setCurrentVolume(value)
-        val am = getSystemService(AUDIO_SERVICE) as AudioManager
-        val steps = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(value / 100f * steps), 0)
+        applyStreamVolume(value)
         if (direction < 0) quickStop()
     }
     private fun quickStop() {
@@ -306,7 +318,7 @@ class RecorderService : Service() {
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setSilent(true)
+            .setDefaults(0)
             .setVisibility(Notification.VISIBILITY_SECRET)
             .addAction(Notification.Action.Builder(null, "Arrêter", actionIntent(ACTION_STOP)).build())
         if (state == "paused") builder.addAction(Notification.Action.Builder(null, "Reprendre", actionIntent(ACTION_RESUME)).build())
