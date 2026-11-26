@@ -6,19 +6,20 @@ plugins {
 android {
     namespace = "fr.local.convertisseuraudio"
     compileSdk = 35
+    ndkVersion = "28.2.13676358"
+    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
     defaultConfig {
         applicationId = "fr.local.convertisseuraudio"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.8.0"
+        versionCode = 16
+        versionName = "0.9.1.1"
     }
     buildTypes {
         getByName("release") {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("debug") // Installable test release; not for Play Store
         }
     }
     compileOptions {

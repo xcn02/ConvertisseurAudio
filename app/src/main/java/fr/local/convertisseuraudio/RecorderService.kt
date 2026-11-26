@@ -4,8 +4,6 @@ import android.app.*
 import android.content.*
 import android.content.pm.ServiceInfo
 import android.media.*
-import android.media.session.MediaSession
-import android.media.session.PlaybackState
 import android.os.*
 import java.io.File
 import java.text.SimpleDateFormat
@@ -17,12 +15,12 @@ class RecorderService : Service() {
         const val ACTION_PAUSE = "fr.local.convertisseuraudio.PAUSE"
         const val ACTION_RESUME = "fr.local.convertisseuraudio.RESUME"
         const val ACTION_STOP = "fr.local.convertisseuraudio.STOP"
-        const val ACTION_STOP_AND_CLOSE = "fr.local.convertisseuraudio.STOP_AND_CLOSE"
-        const val ACTION_CLOSE = "fr.local.convertisseuraudio.CLOSE"
+        const val ACTION_DISCARD = "fr.local.convertisseuraudio.DISCARD"
         const val ACTION_STATE = "fr.local.convertisseuraudio.STATE"
         const val EXTRA_STATE = "state"
         @Volatile var state = "idle"
         @Volatile var routeLabel = "Source non vérifiée"
+        @Volatile var activeProfileLabel = "Original"
         @Volatile var seconds = 0L
         @Volatile var amplitude = 0
         val peaks = ArrayList<Int>()
@@ -30,74 +28,12 @@ class RecorderService : Service() {
         const val CHANNEL_ID = "audio_recording"
         const val NOTIF_ID = 1024
         fun folder(context: Context): File = File(context.filesDir, "audio").apply { mkdirs() }
-        fun stopAndClose(context: Context) {
-            if (state == "idle") {
-                context.sendBroadcast(Intent(ACTION_CLOSE).setPackage(context.packageName)); return
-            }
-            context.startService(Intent(context, RecorderService::class.java).setAction(ACTION_STOP_AND_CLOSE))
-        }
     }
     private var recorder: MediaRecorder? = null
+    private var pcmRecorder: PcmVoiceRecorder? = null
     private var routingBluetooth = false
     private var previousMode = AudioManager.MODE_NORMAL
-    private var session: MediaSession? = null
-    private var lastVolumeDown = 0L
     private var lastShownSecond = -1L
-    private inner class RecorderVolumeProvider : VolumeProvider(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, 100, 50) {
-        override fun onAdjustVolume(direction: Int) {
-            when (direction) {
-                AudioManager.ADJUST_LOWER -> bump(-1)
-                AudioManager.ADJUST_RAISE -> bump(1)
-            }
-        }
-        override fun onSetVolumeTo(volume: Int) {
-            val value = volume.coerceIn(0, 100)
-            setCurrentVolume(value)
-            applyStreamVolume(value)
-        }
-    }
-    private val volumeProvider = RecorderVolumeProvider()
-    private fun applyStreamVolume(value: Int) {
-        val am = getSystemService(AUDIO_SERVICE) as AudioManager
-        val steps = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(value / 100f * steps), 0)
-    }
-    private fun bump(direction: Int) {
-        val value = (volumeProvider.currentVolume + direction).coerceIn(0, 100)
-        volumeProvider.setCurrentVolume(value)
-        applyStreamVolume(value)
-        if (direction < 0) quickStop()
-    }
-    private fun quickStop() {
-        val now = SystemClock.elapsedRealtime()
-        if (lastVolumeDown != 0L && now - lastVolumeDown <= 650L) { lastVolumeDown = 0L; stopAndClose(this) }
-        else lastVolumeDown = now
-    }
-    private fun accessibilityActive(): Boolean =
-        (getSystemService(ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager)
-            .getEnabledAccessibilityServiceList(android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-            .any { it.resolveInfo.serviceInfo.packageName == packageName }
-    private fun ensureSession() {
-        if (session != null || accessibilityActive()) return
-        if (!getSharedPreferences("settings", MODE_PRIVATE).getBoolean("quick_stop_volume", false)) return
-        session = MediaSession(this, "convertisseur-recorder").apply {
-            setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
-            setPlaybackToRemote(volumeProvider)
-            setCallback(object : MediaSession.Callback() {
-                override fun onPlay() { if (state == "paused") resumeRecording() else if (state == "idle") startRecording() }
-                override fun onPause() { pauseRecording() }
-                override fun onStop() { stopRecording() }
-            })
-            setPlaybackState(PlaybackState.Builder().setState(PlaybackState.STATE_PLAYING, 0L, 1f).build())
-            isActive = true
-        }
-    }
-    private fun setSessionState(st: Int) {
-        session?.setPlaybackState(PlaybackState.Builder().setState(st, recordedMs, 1f).build())
-        session?.isActive = true
-    }
-    private fun releaseSession() { session?.runCatching { isActive = false; release() }; session = null }
-
     private fun clearBluetooth() {
         if(!routingBluetooth) return
         routingBluetooth=false
@@ -123,7 +59,7 @@ class RecorderService : Service() {
             } })
         } catch(e:Exception) { bluetoothFailure(e.localizedMessage ?: "Connexion Bluetooth impossible") }
     }
-    private fun bluetoothFailure(message:String) { clearBluetooth(); state="idle"; releaseSession(); broadcastState(message); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+    private fun bluetoothFailure(message:String) { clearBluetooth(); state="idle"; broadcastState(message); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
 
     private var target: File? = null
     private var sharedTarget: android.net.Uri? = null
@@ -145,12 +81,13 @@ class RecorderService : Service() {
                     (accumulated + if (state == "recording") SystemClock.elapsedRealtime() - segmentStart else 0L) / 1000L
                 }
                 if (limitSeconds > 0L && seconds >= limitSeconds) { stopRecording(); return }
-                amplitude = if (state == "recording") (recorder?.runCatching { maxAmplitude }?.getOrNull() ?: 0) else 0
+                if(pcmRecorder?.healthy == false) { stopRecording(); return }
+                amplitude = if (state == "recording") (pcmRecorder?.amplitude ?: recorder?.runCatching { maxAmplitude }?.getOrNull() ?: 0) else 0
                 recordedMs = accumulated + if (state == "recording") SystemClock.elapsedRealtime() - segmentStart else 0L
                 if (state != "connecting" && seconds != lastShownSecond) { lastShownSecond = seconds; promote() }
                 if (state == "recording") {
                     peaks.add(amplitude)
-                    if(Build.VERSION.SDK_INT >= 28) routeLabel = runCatching { recorder?.routedDevice?.let { "Microphone : ${when(it.type) { AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Téléphone"; AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth"; AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET -> "Casque filaire"; else -> it.productName.toString() }}" } }.getOrNull() ?: "Source non vérifiée"
+                    if(Build.VERSION.SDK_INT >= 28) routeLabel = runCatching { (pcmRecorder?.routedDevice ?: recorder?.routedDevice)?.let { "Microphone : ${when(it.type) { AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Téléphone"; AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth"; AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET -> "Casque filaire"; else -> it.productName.toString() }}" } }.getOrNull() ?: "Source non vérifiée"
                 }
                 handler.postDelayed(this, 40)
             }
@@ -188,8 +125,8 @@ class RecorderService : Service() {
             ACTION_START -> if (state == "idle") startRecording()
             ACTION_PAUSE -> pauseRecording()
             ACTION_RESUME -> resumeRecording()
-            ACTION_STOP -> stopRecording()
-            ACTION_STOP_AND_CLOSE -> { stopRecording(); sendBroadcast(Intent(ACTION_CLOSE).setPackage(packageName)) }
+            ACTION_STOP -> stopRecording(name = intent.getStringExtra("name"))
+            ACTION_DISCARD -> stopRecording(discard = true)
         }
         return START_NOT_STICKY
     }
@@ -198,49 +135,50 @@ class RecorderService : Service() {
         if(prefs.getString("mic_source","auto")=="bluetooth" && !bluetoothReady) { prepareBluetooth(); return }
         limitSeconds = prefs.getLong("limit_seconds", 180L)
         timerMode = prefs.getString("timer_mode", "record") ?: "record"
-        seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear(); lastShownSecond = -1L; lastVolumeDown = 0L
+        seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear(); lastShownSecond = -1L
         val name = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.US).format(Date()) + ".m4a"
         target = null; sharedTarget = null
         try {
             // Promotion to foreground occurs while the activity is visible and recording is authorized.
             promote()
-            @Suppress("DEPRECATION")
-            val media = MediaRecorder()
-            recorder = media
-            media.setAudioSource(if(bluetoothReady) MediaRecorder.AudioSource.VOICE_COMMUNICATION else MediaRecorder.AudioSource.MIC)
+            val profile = VoiceProfile.from(prefs)
+            activeProfileLabel = VoiceProfile.labels.getOrElse(prefs.getInt("voice_profile",0)) { "Original" }
+            val digital = prefs.getInt("voice_profile",0) != 0
+            val rate = if(bluetoothReady) 16000 else 44100
+            val bitrate = prefs.getInt("bitrate",64000)
+            val audioSource = if(bluetoothReady || prefs.getBoolean("voice_capture",false)) MediaRecorder.AudioSource.VOICE_COMMUNICATION else MediaRecorder.AudioSource.MIC
             routeLabel = "Source non vérifiée"
             val source = prefs.getString("mic_source","auto")
-            if(source != "auto") {
-                check(Build.VERSION.SDK_INT >= 28) { "Sélection du microphone : Android 9 minimum" }
+            val preferred = if(source != "auto") {
+                check(digital || Build.VERSION.SDK_INT >= 28) { "Sélection du microphone : Android 9 minimum pour le mode original" }
                 val types = when(source) {
                     "internal" -> setOf(AudioDeviceInfo.TYPE_BUILTIN_MIC)
                     "wired" -> setOf(AudioDeviceInfo.TYPE_WIRED_HEADSET,AudioDeviceInfo.TYPE_USB_HEADSET)
                     else -> setOf(AudioDeviceInfo.TYPE_BLUETOOTH_SCO,AudioDeviceInfo.TYPE_BLE_HEADSET)
                 }
-                val device=audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.type in types } ?: error("Microphone choisi indisponible")
-                check(media.setPreferredDevice(device)) { "Sélection du microphone refusée" }
-            }
-            media.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            media.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            media.setAudioChannels(1)
-            media.setAudioEncodingBitRate(prefs.getInt("bitrate", 64000))
-            media.setAudioSamplingRate(if(bluetoothReady) 16000 else 44100)
+                audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.type in types } ?: error("Microphone choisi indisponible")
+            } else null
             if (Build.VERSION.SDK_INT >= 29) {
-                val uri = AudioStorage.create(this, name)
-                sharedTarget = uri
-                val fd = contentResolver.openFileDescriptor(uri, "rw") ?: error("Fichier inaccessible")
-                descriptor = fd
-                media.setOutputFile(fd.fileDescriptor)
+                val uri = AudioStorage.create(this,name); sharedTarget=uri
+                descriptor=contentResolver.openFileDescriptor(uri,"rw") ?: error("Fichier inaccessible")
+            } else target=File(folder(this),name)
+            if(digital) {
+                val pcm=PcmVoiceRecorder(rate,bitrate,audioSource,preferred,profile,descriptor?.fileDescriptor,target?.absolutePath)
+                pcmRecorder=pcm; pcm.start()
             } else {
-                target = File(folder(this), name)
-                media.setOutputFile(target!!.absolutePath)
+                @Suppress("DEPRECATION")
+                val media=MediaRecorder(); recorder=media
+                media.setAudioSource(audioSource)
+                if(preferred!=null && Build.VERSION.SDK_INT>=28) check(media.setPreferredDevice(preferred)) { "Sélection du microphone refusée" }
+                media.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                media.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                media.setAudioChannels(1); media.setAudioEncodingBitRate(bitrate); media.setAudioSamplingRate(rate)
+                if(descriptor!=null) media.setOutputFile(descriptor!!.fileDescriptor) else media.setOutputFile(target!!.absolutePath)
+                media.prepare(); media.start()
             }
-            media.prepare()
-            media.start()
             wallStart = SystemClock.elapsedRealtime()
             segmentStart = wallStart
             state = "recording"
-            ensureSession()
             handler.removeCallbacks(clock)
             handler.post(clock)
             promote()
@@ -248,8 +186,9 @@ class RecorderService : Service() {
         } catch (e: Exception) {
             recorder?.runCatching { release() }
             recorder = null
+            pcmRecorder?.runCatching { stop() }; pcmRecorder=null
             finalizeTarget(false)
-            clearBluetooth(); state = "idle"; releaseSession()
+            clearBluetooth(); state = "idle"
             broadcastState("Impossible de démarrer : ${e.localizedMessage}")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -258,51 +197,61 @@ class RecorderService : Service() {
     private fun pauseRecording() {
         if (state != "recording") return
         try {
-            recorder?.pause()
+            if(pcmRecorder!=null) pcmRecorder?.pause() else recorder?.pause()
             accumulated += SystemClock.elapsedRealtime() - segmentStart
             state = "paused"
-            setSessionState(PlaybackState.STATE_PAUSED)
             promote(); broadcastState()
         } catch (e: Exception) { stopRecording() }
     }
     private fun resumeRecording() {
         if (state != "paused") return
         try {
-            recorder?.resume()
+            if(pcmRecorder!=null) pcmRecorder?.resume() else recorder?.resume()
             segmentStart = SystemClock.elapsedRealtime()
             state = "recording"
-            setSessionState(PlaybackState.STATE_PLAYING)
             promote(); broadcastState()
         } catch (e: Exception) { stopRecording() }
     }
-    private fun stopRecording() {
+    private fun stopRecording(discard: Boolean = false, name: String? = null) {
         if(state=="connecting") { bluetoothFailure("Connexion annulée"); return }
         if (state == "idle") { stopSelf(); return }
+        if (state == "saving") return
         handler.removeCallbacks(clock)
         val current = recorder
         recorder = null
+        val pcm=pcmRecorder; pcmRecorder=null
+        if(pcm!=null) {
+            state="saving"; amplitude=0; promote(); broadcastState()
+            Thread({
+                val ok=runCatching { pcm.stop() }.getOrDefault(false)
+                handler.post { finishStopped(ok,discard,name) }
+            },"voice-save").start()
+            return
+        }
         var valid = true
         try { current?.stop() } catch (_: RuntimeException) { valid = false }
         finally { current?.runCatching { release() } }
-        clearBluetooth(); valid = finalizeTarget(valid)
+        finishStopped(valid,discard,name)
+    }
+    private fun finishStopped(complete:Boolean, discard:Boolean, name:String?) {
+        clearBluetooth(); val valid = finalizeTarget(complete && !discard, name)
         state = "idle"; seconds = 0L; amplitude = 0
-        releaseSession()
-        broadcastState(if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé")
+        broadcastState(if (discard) "Enregistrement abandonné" else if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
-    private fun finalizeTarget(valid: Boolean): Boolean {
+    private fun finalizeTarget(valid: Boolean, name: String? = null): Boolean {
         runCatching { descriptor?.close() }; descriptor = null
         val uri = sharedTarget; sharedTarget = null
         val file = target; target = null
         if (uri != null) {
             return runCatching {
-                if (valid) contentResolver.update(uri, ContentValues().apply { put(android.provider.MediaStore.Audio.Media.IS_PENDING, 0) }, null, null) > 0
+                if (valid) contentResolver.update(uri, ContentValues().apply { put(android.provider.MediaStore.Audio.Media.IS_PENDING, 0); if(!name.isNullOrBlank() && !name.contains('/') && !name.contains('\\')) put(android.provider.MediaStore.Audio.Media.DISPLAY_NAME,name.removeSuffix(".m4a")+".m4a") }, null, null) > 0
                 else { contentResolver.delete(uri, null, null); false }
             }.getOrDefault(false)
         }
         if (!valid) file?.delete()
-        else if (file != null) runCatching { File(file.path + ".peaks").writeText(peaks.joinToString(",")) }
+        else if (file != null) runCatching { val dest = if(!name.isNullOrBlank() && !name.contains('/') && !name.contains('\\')) File(file.parentFile,name.removeSuffix(".m4a")+".m4a") else file; val saved=if(dest!=file && !dest.exists() && file.renameTo(dest)) dest else file; File(saved.path + ".peaks").writeText(peaks.joinToString(",")) }
         return valid && file != null
     }
     private fun actionIntent(action: String): PendingIntent = PendingIntent.getService(
@@ -312,18 +261,20 @@ class RecorderService : Service() {
     private fun promote() {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val builder = Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_stat_dot)
-            .setContentTitle(if (state == "paused") "Enregistrement · pause" else if (state == "connecting") "Enregistrement · connexion" else "Enregistrement")
+            .setSmallIcon(R.drawable.ic_stat_audio)
+            .setContentTitle(if (state == "paused") "Enregistrement · pause" else if (state == "connecting") "Enregistrement · connexion" else if (state == "saving") "Enregistrement · sauvegarde" else "Enregistrement")
             .setContentText(String.format(Locale.FRANCE, "%02d:%02d", recordedMs / 60000, recordedMs / 1000 % 60))
             .setShowWhen(false)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setDefaults(0)
-            .setVisibility(Notification.VISIBILITY_SECRET)
-            .addAction(Notification.Action.Builder(null, "Arrêter", actionIntent(ACTION_STOP)).build())
-        if (state == "paused") builder.addAction(Notification.Action.Builder(null, "Reprendre", actionIntent(ACTION_RESUME)).build())
-        else builder.addAction(Notification.Action.Builder(null, "Pause", actionIntent(ACTION_PAUSE)).build())
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+        if(state != "saving") {
+            builder.addAction(Notification.Action.Builder(null, "Arrêter", actionIntent(ACTION_STOP)).build())
+            if (state == "paused") builder.addAction(Notification.Action.Builder(null, "Reprendre", actionIntent(ACTION_RESUME)).build())
+            else if(state=="recording") builder.addAction(Notification.Action.Builder(null, "Pause", actionIntent(ACTION_PAUSE)).build())
+        }
         val notif = builder.build()
         if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         else startForeground(NOTIF_ID, notif)
@@ -334,12 +285,13 @@ class RecorderService : Service() {
     override fun onDestroy() {
         handler.removeCallbacks(clock)
         callback?.let { audioManager.unregisterAudioDeviceCallback(it) }
+        if(pcmRecorder!=null) { val valid=runCatching { pcmRecorder?.stop() == true }.getOrDefault(false); pcmRecorder=null; finalizeTarget(valid) }
         if (recorder != null) {
             val valid = runCatching { recorder?.stop() }.isSuccess
             runCatching { recorder?.release() }; recorder = null
             finalizeTarget(valid)
         }
-        clearBluetooth(); state = "idle"; releaseSession()
+        clearBluetooth(); state = "idle"
         super.onDestroy()
     }
 }
