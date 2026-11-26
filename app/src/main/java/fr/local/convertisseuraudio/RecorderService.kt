@@ -15,6 +15,7 @@ class RecorderService : Service() {
         const val ACTION_PAUSE = "fr.local.convertisseuraudio.PAUSE"
         const val ACTION_RESUME = "fr.local.convertisseuraudio.RESUME"
         const val ACTION_STOP = "fr.local.convertisseuraudio.STOP"
+        const val ACTION_STOP_EXIT = "fr.local.convertisseuraudio.STOP_EXIT"
         const val ACTION_DISCARD = "fr.local.convertisseuraudio.DISCARD"
         const val ACTION_STATE = "fr.local.convertisseuraudio.STATE"
         const val EXTRA_STATE = "state"
@@ -28,6 +29,17 @@ class RecorderService : Service() {
         const val CHANNEL_ID = "audio_recording"
         const val NOTIF_ID = 1024
         fun folder(context: Context): File = File(context.filesDir, "audio").apply { mkdirs() }
+    }
+    private var stopNavigation = "stay"
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != Intent.ACTION_SCREEN_OFF || state !in setOf("recording", "paused")) return
+            val choice = getSharedPreferences("settings", MODE_PRIVATE).getString("lock_action", "stay")
+            if (choice == "stop_home" || choice == "stop_exit") {
+                stopNavigation = choice
+                stopRecording()
+            }
+        }
     }
     private var recorder: MediaRecorder? = null
     private var pcmRecorder: PcmVoiceRecorder? = null
@@ -96,6 +108,8 @@ class RecorderService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF), RECEIVER_NOT_EXPORTED)
+        else @Suppress("DEPRECATION") registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
         val channel = NotificationChannel(CHANNEL_ID, "Enregistrement audio", NotificationManager.IMPORTANCE_LOW).apply { setSound(null,null); enableVibration(false) }
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -126,6 +140,7 @@ class RecorderService : Service() {
             ACTION_PAUSE -> pauseRecording()
             ACTION_RESUME -> resumeRecording()
             ACTION_STOP -> stopRecording(name = intent.getStringExtra("name"))
+            ACTION_STOP_EXIT -> if (state == "recording" || state == "paused") { stopNavigation = "stop_exit"; stopRecording() }
             ACTION_DISCARD -> stopRecording(discard = true)
         }
         return START_NOT_STICKY
@@ -135,6 +150,7 @@ class RecorderService : Service() {
         if(prefs.getString("mic_source","auto")=="bluetooth" && !bluetoothReady) { prepareBluetooth(); return }
         limitSeconds = prefs.getLong("limit_seconds", 180L)
         timerMode = prefs.getString("timer_mode", "record") ?: "record"
+        stopNavigation = "stay"
         seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear(); lastShownSecond = -1L
         val name = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.US).format(Date()) + ".m4a"
         target = null; sharedTarget = null
@@ -236,7 +252,9 @@ class RecorderService : Service() {
     private fun finishStopped(complete:Boolean, discard:Boolean, name:String?) {
         clearBluetooth(); val valid = finalizeTarget(complete && !discard, name)
         state = "idle"; seconds = 0L; amplitude = 0
-        broadcastState(if (discard) "Enregistrement abandonné" else if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé")
+        val navigation = if (valid && !discard) stopNavigation else "stay"
+        stopNavigation = "stay"
+        broadcastState(if (discard) "Enregistrement abandonné" else if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé", navigation)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -274,16 +292,18 @@ class RecorderService : Service() {
             builder.addAction(Notification.Action.Builder(null, "Arrêter", actionIntent(ACTION_STOP)).build())
             if (state == "paused") builder.addAction(Notification.Action.Builder(null, "Reprendre", actionIntent(ACTION_RESUME)).build())
             else if(state=="recording") builder.addAction(Notification.Action.Builder(null, "Pause", actionIntent(ACTION_PAUSE)).build())
+            if (state == "recording" || state == "paused") builder.addAction(Notification.Action.Builder(null, "Arrêter et quitter", actionIntent(ACTION_STOP_EXIT)).build())
         }
         val notif = builder.build()
         if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         else startForeground(NOTIF_ID, notif)
     }
-    private fun broadcastState(message: String? = null) {
-        sendBroadcast(Intent(ACTION_STATE).setPackage(packageName).putExtra(EXTRA_STATE, state).putExtra("seconds", seconds).putExtra("message", message))
+    private fun broadcastState(message: String? = null, navigation: String = "stay") {
+        sendBroadcast(Intent(ACTION_STATE).setPackage(packageName).putExtra(EXTRA_STATE, state).putExtra("seconds", seconds).putExtra("message", message).putExtra("navigation", navigation))
     }
     override fun onDestroy() {
         handler.removeCallbacks(clock)
+        runCatching { unregisterReceiver(screenOffReceiver) }
         callback?.let { audioManager.unregisterAudioDeviceCallback(it) }
         if(pcmRecorder!=null) { val valid=runCatching { pcmRecorder?.stop() == true }.getOrDefault(false); pcmRecorder=null; finalizeTarget(valid) }
         if (recorder != null) {

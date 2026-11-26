@@ -113,8 +113,25 @@ class MainActivity : Activity() {
         "Temps" to linkedMapOf("s" to 1.0, "min" to 60.0, "h" to 3600.0, "jour" to 86400.0),
         "Angle" to linkedMapOf("°" to 1.0, "rad" to 180.0/Math.PI, "tour" to 360.0)
     )
+    private var lastVolumePress = 0L
+    private var consumeVolumeUp = false
+    private var privacyPending = false
+    private var savePanel: android.app.Dialog? = null
+    private var privacyPanel: android.app.Dialog? = null
+    private val privacyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (prefs.getString("lock_action", "stay") == "privacy" && page in setOf("audio", "files", "player", "audio_settings", "voice_settings")) privacyPending = true
+        }
+    }
     private val receiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            if (RecorderService.state == "idle") {
+                lastVolumePress = 0L
+                when (intent?.getStringExtra("navigation")) {
+                    "stop_exit" -> { savePanel?.dismiss(); privacyPanel?.dismiss(); finishAndRemoveTask(); return }
+                    "stop_home" -> { savePanel?.dismiss(); privacyPanel?.dismiss(); privacyPending = false; renderConverter(); return }
+                }
+            }
             if (page == "audio") {
                 updateRecorderControls()
                 intent?.getStringExtra("message")?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show(); showAudio() }
@@ -144,13 +161,53 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         // Protects screen content in recent-app previews and screenshots.
         applyPrivacy()
+        registerLocal(RecorderService.ACTION_STATE, receiver)
+        registerLocal(Intent.ACTION_SCREEN_OFF, privacyReceiver)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 22)
         renderConverter()
     }
-    override fun onStart() { super.onStart(); if (page == "audio") { uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick) }; if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE), RECEIVER_NOT_EXPORTED) else @Suppress("DEPRECATION") registerReceiver(receiver, IntentFilter(RecorderService.ACTION_STATE)) }
-    override fun onStop() { uiHandler.removeCallbacks(meterTick); super.onStop(); unregisterReceiver(receiver) }
-    override fun onDestroy() { releasePlayer(); uiHandler.removeCallbacksAndMessages(null); super.onDestroy() }
+    override fun onStart() { super.onStart(); if (page == "audio") { uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick) } }
+    override fun onStop() { lastVolumePress = 0L; consumeVolumeUp = false; uiHandler.removeCallbacks(meterTick); super.onStop() }
+    override fun onResume() {
+        super.onResume()
+        if (privacyPending) {
+            privacyPending = false
+            val active = RecorderService.state in setOf("recording", "paused", "connecting", "saving")
+            val dialog = android.app.Dialog(this, android.R.style.Theme_Material_NoActionBar)
+            val panel = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                setBackgroundColor(if (dark) 0xff191919.toInt() else 0xffF6F6F6.toInt())
+                setPadding(dp(24), dp(24), dp(24), dp(24))
+                addView(this@MainActivity.text(if (active) "Enregistrement audio actif" else "Contenu audio protégé", 20f, true))
+                addView(this@MainActivity.button("Afficher l’écran audio") { dialog.dismiss() })
+            }
+            privacyPanel = dialog
+            dialog.setOnDismissListener { privacyPanel = null }
+            dialog.setContentView(panel); dialog.setCancelable(false)
+            dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            dialog.show(); dialog.window?.setLayout(-1, -1)
+        }
+    }
+    override fun onDestroy() { savePanel?.dismiss(); privacyPanel?.dismiss(); runCatching { unregisterReceiver(receiver) }; runCatching { unregisterReceiver(privacyReceiver) }; releasePlayer(); uiHandler.removeCallbacksAndMessages(null); super.onDestroy() }
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val choice = prefs.getString("volume_action", "off")
+        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN && event.action == KeyEvent.ACTION_UP && consumeVolumeUp) { consumeVolumeUp = false; return true }
+        if (page != "audio" || choice == "off" || RecorderService.state !in setOf("recording", "paused")) {
+            lastVolumePress = 0L
+            return super.dispatchKeyEvent(event)
+        }
+        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            val now = SystemClock.elapsedRealtime()
+            if (lastVolumePress != 0L && now - lastVolumePress <= 650L) {
+                lastVolumePress = 0L; consumeVolumeUp = true
+                sendAction(if (choice == "stop_exit") RecorderService.ACTION_STOP_EXIT else RecorderService.ACTION_STOP)
+                return true
+            }
+            lastVolumePress = now
+        }
+        return super.dispatchKeyEvent(event)
+    }
     override fun onBackPressed() {
         when (page) { "converter" -> super.onBackPressed(); "settings" -> renderConverter(); "audio" -> leaveRecorder(); "audio_settings" -> showAudio(); "voice_settings" -> showAudioSettings(); "files" -> { if(selectionMode) { selectionMode=false; selected.clear(); showFiles(); return }; selected.clear(); if(trashMode) { trashMode=false; showFiles() } else showAudio() }; "player" -> showFiles(); else -> renderConverter() }
     }
@@ -284,7 +341,7 @@ class MainActivity : Activity() {
         root.addView(button("Enregistreur audio  ›") { showAudio() })
         heading("Application")
         root.addView(text("Stockage local uniquement. Pas de connexion réseau, compte ou suivi publicitaire."))
-        root.addView(text("Version 0.9.1", 13f))
+        root.addView(text("Version 0.9.2", 13f))
     }
     private fun toolbar(back: () -> Unit, action: String, next: () -> Unit) {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -312,6 +369,7 @@ class MainActivity : Activity() {
         bar.addView(text("Sauvegarder",18f,true),LinearLayout.LayoutParams(0,-2,1f))
         bar.addView(iconButton("✓","Sauvegarder") { val n=name.text.toString().trim(); if(n.isBlank() || n.contains('/') || n.contains('\\')) { name.error="Nom invalide"; return@iconButton }; val i=Intent(this,RecorderService::class.java).setAction(RecorderService.ACTION_STOP).putExtra("name",n); startService(i); dialog.dismiss(); showSettings() },LinearLayout.LayoutParams(dp(48),dp(48)))
         panel.addView(bar); panel.addView(text("Nom du fichier",12f)); panel.addView(name); panel.addView(iconButton("Reprendre l’enregistrement","Reprendre") { dialog.dismiss(); sendAction(RecorderService.ACTION_RESUME) })
+        savePanel = dialog; dialog.setOnDismissListener { savePanel = null }
         dialog.setContentView(panel); dialog.window?.apply { setBackgroundDrawableResource(android.R.color.transparent); setLayout(-1,-2); setGravity(Gravity.BOTTOM) }; dialog.show(); dialog.window?.setLayout(-1,-2)
     }
     private fun controlRow(vararg views: View): LinearLayout = LinearLayout(this).apply {
@@ -377,6 +435,19 @@ class MainActivity : Activity() {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) { prefs.edit().putString("timer_mode", if (position == 0) "record" else "elapsed").apply() }
         }
+        heading("Commandes rapides et navigation")
+        fun navigationSetting(label: String, key: String, labels: List<String>, values: List<String>) {
+            root.addView(text(label, 15f))
+            val control = spinner(labels, values.indexOf(prefs.getString(key, values.first())).coerceAtLeast(0))
+            root.addView(control)
+            control.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { prefs.edit().putString(key, values[position]).apply(); lastVolumePress = 0L }
+            }
+        }
+        navigationSetting("Comportement à l’extinction de l’écran", "lock_action", listOf("Conserver l’écran actuel", "Confidentialité au retour", "Arrêter, sauvegarder et revenir au convertisseur", "Arrêter, sauvegarder et quitter"), listOf("stay", "privacy", "stop_home", "stop_exit"))
+        navigationSetting("Double appui Volume − (enregistreur affiché)", "volume_action", listOf("Désactivé", "Arrêter et sauvegarder", "Arrêter, sauvegarder et quitter"), listOf("off", "stop", "stop_exit"))
+        root.addView(text("La fermeture intervient après la sauvegarde. Les touches restent normales hors enregistrement.", 13f))
         heading("Stockage")
         root.addView(text(if (Build.VERSION.SDK_INT >= 29) "Nouveaux enregistrements : Music/Convertisseur/Recordings. Un seul original, accessible dans le gestionnaire de fichiers." else "Stockage interne sur Android 8 et 9 ; export manuel disponible.", 14f))
         heading("Règles de connexion")
