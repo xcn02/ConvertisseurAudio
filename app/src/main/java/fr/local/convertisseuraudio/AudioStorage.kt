@@ -8,14 +8,28 @@ import kotlin.math.abs
 object AudioStorage {
     data class Recording(val name: String, val size: Long, val modified: Long, val uri: android.net.Uri? = null, val file: File? = null) {
         val key: String get() = uri?.toString() ?: file!!.absolutePath
-        fun trash(context: Context, value: Boolean): Boolean = Build.VERSION.SDK_INT >= 30 && uri != null && context.contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_TRASHED, if(value) 1 else 0) }, null, null)>0
+        fun trash(context: Context, value: Boolean): Boolean {
+            if(uri != null) {
+                val values=ContentValues().apply {
+                    if(Build.VERSION.SDK_INT>=30) put(MediaStore.MediaColumns.IS_TRASHED,if(value) 1 else 0)
+                    else put(MediaStore.MediaColumns.RELATIVE_PATH,if(value) "Music/Convertisseur/Trash/" else "Music/Convertisseur/Recordings/")
+                }
+                return context.contentResolver.update(uri,values,null,null)>0
+            }
+            val src=file ?: return false
+            val dir=if(value) File(context.filesDir,"audio-trash").apply { mkdirs() } else RecorderService.folder(context)
+            var dest=File(dir,src.name)
+            if(dest.exists()) dest=File(dir,src.nameWithoutExtension+"-"+java.util.UUID.randomUUID().toString().take(8)+".m4a")
+            if(!src.renameTo(dest)) return false
+            File(src.path+".peaks").renameTo(File(dest.path+".peaks")); Markers.move(context,src.absolutePath,dest.absolutePath); return true
+        }
         val title: String get() = name.removeSuffix(".m4a")
         fun open(context: Context): java.io.InputStream = if (uri != null) context.contentResolver.openInputStream(uri) ?: error("Fichier inaccessible") else file!!.inputStream()
         fun rename(context: Context, name: String): Boolean {
             if (name.isBlank() || name.contains('/') || name.contains('\\')) return false
             val newName = name.removeSuffix(".m4a") + ".m4a"
             return if (uri != null) context.contentResolver.update(uri, ContentValues().apply { put(MediaStore.Audio.Media.DISPLAY_NAME, newName) }, null, null) > 0
-            else { val dest = File(file!!.parentFile, newName); if (dest.exists()) false else if (file.renameTo(dest)) { File(file.path + ".peaks").renameTo(File(dest.path + ".peaks")); true } else false }
+            else { val dest = File(file!!.parentFile, newName); if (dest.exists()) false else if (file.renameTo(dest)) { File(file.path + ".peaks").renameTo(File(dest.path + ".peaks")); Markers.move(context,file.absolutePath,dest.absolutePath); true } else false }
         }
         fun delete(context: Context): Boolean = if (uri != null) context.contentResolver.delete(uri, null, null) > 0 else if (file!!.delete()) { File(file.path + ".peaks").delete(); true } else false
     }
@@ -36,12 +50,12 @@ object AudioStorage {
                 putString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION,"relative_path = ? AND is_pending = 0 AND is_trashed = ?")
                 putStringArray(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,arrayOf("Music/Convertisseur/Recordings/",if(trashed) "1" else "0"))
                 putInt(MediaStore.QUERY_ARG_MATCH_TRASHED,MediaStore.MATCH_INCLUDE)
-            },null) else if(!trashed) context.contentResolver.query(collection,projection,"relative_path = ? AND is_pending = 0",arrayOf("Music/Convertisseur/Recordings/"),null) else null
+            },null) else context.contentResolver.query(collection,projection,"relative_path = ? AND is_pending = 0",arrayOf(if(trashed) "Music/Convertisseur/Trash/" else "Music/Convertisseur/Recordings/"),null)
             query?.use { c ->
                 while (c.moveToNext()) items.add(Recording(c.getString(1), c.getLong(2), c.getLong(3) * 1000L, ContentUris.withAppendedId(collection, c.getLong(0))))
             }
         }
-        if(!trashed) RecorderService.folder(context).listFiles()?.filter { it.extension == "m4a" }?.forEach { items.add(Recording(it.name, it.length(), it.lastModified(), file = it)) }
+        (if(trashed) File(context.filesDir,"audio-trash") else RecorderService.folder(context)).listFiles()?.filter { it.extension == "m4a" }?.forEach { items.add(Recording(it.name, it.length(), it.lastModified(), file = it)) }
         return items.sortedByDescending { it.modified }
     }
     fun decodePeaks(context: Context, recording: Recording): List<Int> {

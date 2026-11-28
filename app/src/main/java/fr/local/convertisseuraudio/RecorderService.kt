@@ -16,6 +16,8 @@ class RecorderService : Service() {
         const val ACTION_RESUME = "fr.local.convertisseuraudio.RESUME"
         const val ACTION_STOP = "fr.local.convertisseuraudio.STOP"
         const val ACTION_STOP_EXIT = "fr.local.convertisseuraudio.STOP_EXIT"
+        const val ACTION_MARK = "fr.local.convertisseuraudio.MARK"
+        val liveMarkers = mutableListOf<Int>()
         const val ACTION_DISCARD = "fr.local.convertisseuraudio.DISCARD"
         const val ACTION_STATE = "fr.local.convertisseuraudio.STATE"
         const val EXTRA_STATE = "state"
@@ -141,7 +143,8 @@ class RecorderService : Service() {
             ACTION_RESUME -> resumeRecording()
             ACTION_STOP -> stopRecording(name = intent.getStringExtra("name"))
             ACTION_STOP_EXIT -> if (state == "recording" || state == "paused") { stopNavigation = "stop_exit"; stopRecording() }
-            ACTION_DISCARD -> stopRecording(discard = true)
+            ACTION_DISCARD -> stopRecording(discard = true, name = intent.getStringExtra("name"))
+            ACTION_MARK -> if(state == "recording" || state == "paused") { val ms=(accumulated + if(state=="recording") SystemClock.elapsedRealtime()-segmentStart else 0L).coerceIn(0L,Int.MAX_VALUE.toLong()).toInt(); if(ms !in liveMarkers) liveMarkers.add(ms); broadcastState() }
         }
         return START_NOT_STICKY
     }
@@ -151,7 +154,7 @@ class RecorderService : Service() {
         limitSeconds = prefs.getLong("limit_seconds", 180L)
         timerMode = prefs.getString("timer_mode", "record") ?: "record"
         stopNavigation = "stay"
-        seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear(); lastShownSecond = -1L
+        seconds = 0L; accumulated = 0L; recordedMs = 0L; peaks.clear(); liveMarkers.clear(); lastShownSecond = -1L
         val name = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.US).format(Date()) + ".m4a"
         target = null; sharedTarget = null
         try {
@@ -250,26 +253,30 @@ class RecorderService : Service() {
         finishStopped(valid,discard,name)
     }
     private fun finishStopped(complete:Boolean, discard:Boolean, name:String?) {
-        clearBluetooth(); val valid = finalizeTarget(complete && !discard, name)
+        clearBluetooth(); val valid = finalizeTarget(complete, name, discard)
         state = "idle"; seconds = 0L; amplitude = 0
         val navigation = if (valid && !discard) stopNavigation else "stay"
         stopNavigation = "stay"
-        broadcastState(if (discard) "Enregistrement abandonné" else if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé", navigation)
+        broadcastState(if (discard && valid) "Enregistrement déplacé dans la corbeille" else if (valid) "Fichier sauvegardé" else "Enregistrement trop court ou endommagé", navigation)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
-    private fun finalizeTarget(valid: Boolean, name: String? = null): Boolean {
+    private fun finalizeTarget(valid: Boolean, name: String? = null, trash: Boolean = false): Boolean {
         runCatching { descriptor?.close() }; descriptor = null
         val uri = sharedTarget; sharedTarget = null
         val file = target; target = null
         if (uri != null) {
             return runCatching {
-                if (valid) contentResolver.update(uri, ContentValues().apply { put(android.provider.MediaStore.Audio.Media.IS_PENDING, 0); if(!name.isNullOrBlank() && !name.contains('/') && !name.contains('\\')) put(android.provider.MediaStore.Audio.Media.DISPLAY_NAME,name.removeSuffix(".m4a")+".m4a") }, null, null) > 0
+                if (valid) {
+                    val ok=contentResolver.update(uri, ContentValues().apply { put(android.provider.MediaStore.Audio.Media.IS_PENDING, 0); if(!name.isNullOrBlank() && !name.contains('/') && !name.contains('\\')) put(android.provider.MediaStore.Audio.Media.DISPLAY_NAME,name.removeSuffix(".m4a")+".m4a") }, null, null)>0
+                    if(ok) Markers.write(this,uri.toString(),liveMarkers)
+                    if(ok && trash) AudioStorage.Recording("",0,0,uri=uri).trash(this,true) else ok
+                }
                 else { contentResolver.delete(uri, null, null); false }
             }.getOrDefault(false)
         }
         if (!valid) file?.delete()
-        else if (file != null) runCatching { val dest = if(!name.isNullOrBlank() && !name.contains('/') && !name.contains('\\')) File(file.parentFile,name.removeSuffix(".m4a")+".m4a") else file; val saved=if(dest!=file && !dest.exists() && file.renameTo(dest)) dest else file; File(saved.path + ".peaks").writeText(peaks.joinToString(",")) }
+        else if (file != null) return runCatching { val dest = if(!name.isNullOrBlank() && !name.contains('/') && !name.contains('\\')) File(file.parentFile,name.removeSuffix(".m4a")+".m4a") else file; val saved=if(dest!=file && !dest.exists() && file.renameTo(dest)) dest else file; File(saved.path + ".peaks").writeText(peaks.joinToString(",")); Markers.write(this,saved.absolutePath,liveMarkers); if(trash) check(AudioStorage.Recording(saved.name,saved.length(),saved.lastModified(),file=saved).trash(this,true)); true }.getOrDefault(false)
         return valid && file != null
     }
     private fun actionIntent(action: String): PendingIntent = PendingIntent.getService(

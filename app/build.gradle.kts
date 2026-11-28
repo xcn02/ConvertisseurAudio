@@ -12,8 +12,9 @@ android {
         applicationId = "fr.local.convertisseuraudio"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "0.9.2"
+        versionCode = 18
+        versionName = "0.10.0"
+        ndk { abiFilters += "arm64-v8a" }
     }
     buildTypes {
         getByName("release") {

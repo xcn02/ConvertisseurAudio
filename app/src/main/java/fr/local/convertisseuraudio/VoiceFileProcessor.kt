@@ -11,7 +11,7 @@ import java.util.UUID
 
 /** Reprocesses an existing mono recording into a separate temporary AAC file. */
 internal object VoiceFileProcessor {
-    fun process(context:Context, source:AudioStorage.Recording, profile:VoiceProfile, bitrate:Int, rnnoiseStrength:Int?=null):File {
+    fun process(context:Context, source:AudioStorage.Recording, profile:VoiceProfile, bitrate:Int, rnnoiseStrength:Int?=null, selection:LongRange?=null, removeSelection:Boolean=false, progress:((Int)->Unit)?=null):File {
         val output=File.createTempFile("voice-", ".m4a", context.cacheDir)
         val extractor=MediaExtractor()
         var decoder:MediaCodec?=null
@@ -29,6 +29,10 @@ internal object VoiceFileProcessor {
             codec.configure(format,null,null,0); codec.start()
             val out=PcmAacWriter(if(rnnoiseStrength!=null) 48000 else rate,bitrate,MediaMuxer(output.path,MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)); writer=out
             val dsp=VoiceDsp(rate,profile)
+            var sampleIndex=0L
+            val durationUs=if(format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
+            val from=selection?.first?.times(rate)?.div(1000L) ?: 0L
+            val to=selection?.last?.times(rate)?.div(1000L) ?: Long.MAX_VALUE
             if(rnnoiseStrength!=null) neural=RnnoiseFileFilter(rate,rnnoiseStrength) { pcm,n -> out.write(pcm,n) }
             val info=MediaCodec.BufferInfo(); val block=ShortArray(1024)
             var inputDone=false; var outputDone=false; var stalls=0
@@ -56,7 +60,10 @@ internal object VoiceFileProcessor {
                             while(b.remaining()>=2) {
                                 val n=minOf(block.size,b.remaining()/2)
                                 for(i in 0 until n) block[i]=b.short
-                                if(neural!=null) neural.process(block,n) else { dsp.process(block,n); out.write(block,n) }
+                                var count=0
+                                for(i in 0 until n) { val inside=sampleIndex>=from && sampleIndex<to; sampleIndex++; if(selection==null || inside!=removeSelection) block[count++]=block[i] }
+                                if(count>0) { dsp.process(block,count); if(neural!=null) neural.process(block,count) else out.write(block,count) }
+                                if(durationUs>0) progress?.invoke((sampleIndex*100000000L/rate/durationUs).coerceIn(0,100).toInt())
                             }
                         }
                         outputDone=info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
@@ -74,8 +81,8 @@ internal object VoiceFileProcessor {
         }
     }
     /** Explicitly creates a new recording; never overwrites the source. */
-    fun saveCopy(context:Context, temp:File, name:String) {
-        val title=name.removeSuffix(".m4a")+" - traité "+UUID.randomUUID().toString().take(6)+".m4a"
+    fun saveCopy(context:Context, temp:File, name:String, suffix:String="traité") {
+        val title=name.removeSuffix(".m4a")+" - $suffix "+UUID.randomUUID().toString().take(6)+".m4a"
         if(Build.VERSION.SDK_INT>=29) {
             val uri=AudioStorage.create(context,title)
             try {

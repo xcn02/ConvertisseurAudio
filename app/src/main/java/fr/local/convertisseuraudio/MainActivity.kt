@@ -65,7 +65,7 @@ class MainActivity : Activity() {
         "☑" -> R.drawable.ui_select; "☐" -> R.drawable.ui_select_empty; "☷" -> R.drawable.ui_folder; "✓" -> R.drawable.ui_check; "⋮" -> R.drawable.ui_more
         "▶" -> R.drawable.ui_play; "Ⅱ" -> R.drawable.ui_pause; "■" -> R.drawable.ui_stop; "●" -> R.drawable.ui_record
         "↶", "↶ Restaurer" -> R.drawable.ui_restore; "↶ 10" -> R.drawable.ui_rewind; "10 ↷" -> R.drawable.ui_forward
-        "Partager" -> R.drawable.ui_share; "Repères", "+ Repère" -> R.drawable.ui_bookmark; "Améliorer" -> R.drawable.ui_wave
+        "Partager" -> R.drawable.ui_share; "Repères", "+ Repère", "Marqueur" -> R.drawable.ui_bookmark; "Améliorer" -> R.drawable.ui_wave; "Raccourcir" -> R.drawable.ui_scissors
         "Rechercher" -> R.drawable.ui_search; "×" -> R.drawable.ui_close; "⇅" -> R.drawable.ui_swap; "▢" -> R.drawable.ui_copy; "☆" -> R.drawable.ui_star
         else -> 0
     }
@@ -132,10 +132,8 @@ class MainActivity : Activity() {
                     "stop_home" -> { savePanel?.dismiss(); privacyPanel?.dismiss(); privacyPending = false; renderConverter(); return }
                 }
             }
-            if (page == "audio") {
-                updateRecorderControls()
-                intent?.getStringExtra("message")?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show(); showAudio() }
-            }
+            if (page == "audio") updateRecorderControls()
+            intent?.getStringExtra("message")?.let { Toast.makeText(this@MainActivity,it,Toast.LENGTH_SHORT).show(); if(page=="audio") showAudio() }
         }
     }
     private fun registerLocal(filter: String, r: android.content.BroadcastReceiver) {
@@ -147,9 +145,10 @@ class MainActivity : Activity() {
     private var timerText: TextView? = null
     private var routeText: TextView? = null
     private var pauseButton: Button? = null
+    private var liveMarkerButton: Button? = null
     private var waveform: WaveformView? = null
     private val uiHandler = Handler(Looper.getMainLooper())
-    private val meterTick = object : Runnable { override fun run() { if (page == "audio") { updateRecorderControls(); waveform?.live(RecorderService.peaks, RecorderService.recordedMs); uiHandler.postDelayed(this, 40) } } }
+    private val meterTick = object : Runnable { override fun run() { if (page == "audio") { updateRecorderControls(); waveform?.live(RecorderService.peaks, RecorderService.recordedMs); waveform?.markers(if(RecorderService.state=="idle") emptyList() else RecorderService.liveMarkers); uiHandler.postDelayed(this, 40) } } }
     private var startButton: Button? = null
     private val dark get() = resources.configuration.uiMode and 0x30 == 0x20
     private val colors get() = if (dark) intArrayOf(0xffE4E8EF.toInt(), 0xffADB8C8.toInt()) else intArrayOf(0xff263244.toInt(), 0xff596579.toInt())
@@ -168,7 +167,7 @@ class MainActivity : Activity() {
         renderConverter()
     }
     override fun onStart() { super.onStart(); if (page == "audio") { uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick) } }
-    override fun onStop() { lastVolumePress = 0L; consumeVolumeUp = false; uiHandler.removeCallbacks(meterTick); super.onStop() }
+    override fun onStop() { player?.let { m -> activeFile?.let { key -> runCatching { prefs.edit().putInt("position:$key",m.currentPosition).apply() } } }; lastVolumePress = 0L; consumeVolumeUp = false; uiHandler.removeCallbacks(meterTick); super.onStop() }
     override fun onResume() {
         super.onResume()
         if (privacyPending) {
@@ -365,7 +364,7 @@ class MainActivity : Activity() {
         val panel=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setPadding(dp(20),dp(16),dp(20),dp(24)); background=android.graphics.drawable.GradientDrawable().apply { setColor(surface); cornerRadius=dp(24).toFloat() } }
         val bar=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL }
         val name=field(java.text.SimpleDateFormat("yyyy-MM-dd_HH-mm-ss",Locale.US).format(java.util.Date()))
-        bar.addView(iconButton("⌫","Abandonner") { android.app.AlertDialog.Builder(this).setTitle("Abandonner cet enregistrement ?").setNegativeButton("Annuler",null).setPositiveButton("Abandonner") { _,_ -> dialog.dismiss(); sendAction(RecorderService.ACTION_DISCARD); showSettings() }.show() },LinearLayout.LayoutParams(dp(48),dp(48)))
+        bar.addView(iconButton("⌫","Mettre à la corbeille") { startService(Intent(this,RecorderService::class.java).setAction(RecorderService.ACTION_DISCARD).putExtra("name",name.text.toString().trim())); dialog.dismiss(); showSettings(); Toast.makeText(this,"Mise à la corbeille en cours",Toast.LENGTH_SHORT).show() },LinearLayout.LayoutParams(dp(48),dp(48)))
         bar.addView(text("Sauvegarder",18f,true),LinearLayout.LayoutParams(0,-2,1f))
         bar.addView(iconButton("✓","Sauvegarder") { val n=name.text.toString().trim(); if(n.isBlank() || n.contains('/') || n.contains('\\')) { name.error="Nom invalide"; return@iconButton }; val i=Intent(this,RecorderService::class.java).setAction(RecorderService.ACTION_STOP).putExtra("name",n); startService(i); dialog.dismiss(); showSettings() },LinearLayout.LayoutParams(dp(48),dp(48)))
         panel.addView(bar); panel.addView(text("Nom du fichier",12f)); panel.addView(name); panel.addView(iconButton("Reprendre l’enregistrement","Reprendre") { dialog.dismiss(); sendAction(RecorderService.ACTION_RESUME) })
@@ -393,9 +392,11 @@ class MainActivity : Activity() {
         bottomSpace(); space(24)
         val row = LinearLayout(this).apply { orientation=LinearLayout.HORIZONTAL; gravity=Gravity.CENTER }
         row.addView(iconButton("☷","Fichiers") { showFiles() },LinearLayout.LayoutParams(0,dp(52),1f))
+        liveMarkerButton=iconButton("Marqueur","Ajouter un marqueur") { sendAction(RecorderService.ACTION_MARK) }.also { row.addView(it,LinearLayout.LayoutParams(0,dp(52),1f)) }
         startButton=primary("●") { if(RecorderService.state=="idle") startRecording() else sendAction(RecorderService.ACTION_STOP) }.also { row.addView(it,LinearLayout.LayoutParams(dp(76),dp(76)).apply { marginStart=dp(12); marginEnd=dp(12) }) }
         pauseButton=iconButton("Ⅱ","Pause ou reprise") { sendAction(if(RecorderService.state=="paused") RecorderService.ACTION_RESUME else RecorderService.ACTION_PAUSE) }.also { row.addView(it,LinearLayout.LayoutParams(0,dp(52),1f)) }
-        root.addView(row); updateRecorderControls()
+        row.addView(Space(this),LinearLayout.LayoutParams(0,dp(52),1f))
+        screenFrame.addView(row,LinearLayout.LayoutParams(-1,dp(90))); updateRecorderControls()
         uiHandler.removeCallbacks(meterTick); uiHandler.post(meterTick)
     }
     private fun showAudioSettings() {
@@ -511,26 +512,57 @@ class MainActivity : Activity() {
         root.addView(button("Faire un essai dans l’enregistreur") { showAudio() })
     }
     private fun improveFile(file:AudioStorage.Recording) {
-        val labels=(VoiceProfile.labels.drop(1)+listOf("RNNoise · léger", "RNNoise · équilibré", "RNNoise · renforcé")).toTypedArray()
+        val labels=(VoiceProfile.labels.drop(1)+listOf("RNNoise · léger", "RNNoise · équilibré", "RNNoise · renforcé", "Traitement combiné")).toTypedArray()
         android.app.AlertDialog.Builder(this).setTitle("Améliorer l’audio").setItems(labels) { _,index ->
+            if(index==7) { combinedTreatment(file); return@setItems }
             val profile=VoiceProfile.forIndex(prefs,index+1)
             val neural=listOf(35,65,100).getOrNull(index-4)
-            player?.runCatching { if(isPlaying) pause() }
-            val progress=android.app.ProgressDialog(this).apply { setMessage("Traitement audio…"); setCancelable(false); show() }
-            val app=applicationContext; val bitrate=prefs.getInt("bitrate",64000)
-            Thread({
-                val result=runCatching { VoiceFileProcessor.process(app,file,profile,bitrate,neural) }
-                runOnUiThread {
-                    if(isFinishing || isDestroyed) { result.getOrNull()?.delete(); return@runOnUiThread }
-                    progress.dismiss()
-                    result.onSuccess { previewProcessed(file,it) }.onFailure { android.app.AlertDialog.Builder(this).setTitle("Traitement impossible").setMessage(it.localizedMessage ?: "Erreur audio").setPositiveButton("OK",null).show() }
-                }
-            },"voice-file").start()
+            processFile(file,profile,neural)
         }.setNegativeButton("Annuler",null).show()
     }
-    private fun previewProcessed(file:AudioStorage.Recording,temp:File) {
+    private fun combinedTreatment(file:AudioStorage.Recording) {
+        val panel=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setPadding(dp(20),dp(8),dp(20),dp(8)) }
+        val noise=CheckBox(this).apply { text="RNNoise"; isChecked=true }; panel.addView(noise)
+        val strength=SeekBar(this).apply { max=100; progress=65 }; panel.addView(strength)
+        val eq=CheckBox(this).apply { text="Clarté vocale"; isChecked=true }; panel.addView(eq)
+        val gain=CheckBox(this).apply { text="Gain automatique doux" }; panel.addView(gain)
+        val rumble=CheckBox(this).apply { text="Atténuer les grondements" }; panel.addView(rumble)
+        android.app.AlertDialog.Builder(this).setTitle("Traitement combiné").setView(panel).setNegativeButton("Annuler",null).setPositiveButton("Préécouter") { _,_ -> processFile(file,VoiceProfile(0,if(eq.isChecked) 35 else 0,gain.isChecked,rumble.isChecked),if(noise.isChecked) strength.progress else null) }.show()
+    }
+    private fun trimFile(file:AudioStorage.Recording) {
+        val m=mediaFor(file) ?: return; if(m.isPlaying) m.pause()
+        val duration=m.duration.coerceAtLeast(1)
+        val panel=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setPadding(dp(20),dp(8),dp(20),dp(8)) }
+        val wave=WaveformView(this); panel.addView(wave); wave.playback(emptyList(),duration,m.currentPosition) { m.seekTo(it) }
+        Thread { val peaks=AudioStorage.decodePeaks(this,file); runOnUiThread { if(player===m && wave.isAttachedToWindow) wave.playback(peaks,duration,m.currentPosition) { m.seekTo(it) } } }.start()
+        val fromLabel=text("",14f); val toLabel=text("",14f); panel.addView(fromLabel)
+        val from=SeekBar(this).apply { max=duration-1 }; panel.addView(from); panel.addView(toLabel)
+        val to=SeekBar(this).apply { max=duration; progress=duration }; panel.addView(to)
+        fun refresh() { fromLabel.text="Début : ${formatTime(from.progress.toLong())}"; toLabel.text="Fin : ${formatTime(to.progress.toLong())}"; wave.selection(from.progress,to.progress) }
+        val listener=object:SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar:SeekBar?,value:Int,user:Boolean) { if(user) { if(bar===from && value>=to.progress) to.progress=(value+1).coerceAtMost(duration); if(bar===to && value<=from.progress) { if(value==0) to.progress=1; from.progress=(to.progress-1).coerceAtLeast(0) }; val pos=if(bar===from) from.progress else to.progress; m.seekTo(pos); wave.position(pos) }; refresh() }
+            override fun onStartTrackingTouch(bar:SeekBar?) {} ; override fun onStopTrackingTouch(bar:SeekBar?) {}
+        }; from.setOnSeekBarChangeListener(listener); to.setOnSeekBarChangeListener(listener); refresh()
+        val dialog=android.app.AlertDialog.Builder(this).setTitle("Raccourcir").setView(panel).setNegativeButton("Annuler",null).setPositiveButton("Garder la sélection") { _,_ -> processFile(file,VoiceProfile(0,0,false,false),null,from.progress.toLong()..to.progress.toLong(),false) }.setNeutralButton("Retirer la sélection",null).create()
+        dialog.setOnShowListener { dialog.getButton(android.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener { if(from.progress==0 && to.progress==duration) { Toast.makeText(this,"Sélectionne une partie du fichier",Toast.LENGTH_SHORT).show() } else { dialog.dismiss(); processFile(file,VoiceProfile(0,0,false,false),null,from.progress.toLong()..to.progress.toLong(),true) } } }; dialog.show()
+    }
+    private fun processFile(file:AudioStorage.Recording,profile:VoiceProfile,neural:Int?,range:LongRange?=null,remove:Boolean=false) {
+        player?.runCatching { if(isPlaying) pause() }
+        val progress=android.app.ProgressDialog(this).apply { setProgressStyle(android.app.ProgressDialog.STYLE_HORIZONTAL); max=100; setMessage("Traitement audio…"); setCancelable(false) }
+        val app=applicationContext; val bitrate=prefs.getInt("bitrate",64000)
+        var last=-1
+        val worker=Thread({
+            val result=runCatching { VoiceFileProcessor.process(app,file,profile,bitrate,neural,range,remove) { value -> if(value!=last) { last=value; runOnUiThread { if(progress.isShowing) progress.progress=value } } } }
+            runOnUiThread {
+                if(isFinishing || isDestroyed || !progress.isShowing) { result.getOrNull()?.delete(); return@runOnUiThread }
+                progress.dismiss(); result.onSuccess { previewProcessed(file,it,if(range==null) "traité" else "montage") }.onFailure { android.app.AlertDialog.Builder(this).setTitle("Traitement impossible").setMessage(it.localizedMessage ?: "Erreur audio").setPositiveButton("OK",null).show() }
+            }
+        },"voice-file")
+        progress.setButton(android.content.DialogInterface.BUTTON_NEGATIVE,"Annuler") { _,_ -> worker.interrupt() }; progress.show(); worker.start()
+    }
+    private fun previewProcessed(file:AudioStorage.Recording,temp:File,suffix:String="traité") {
         var preview:MediaPlayer?=null
-        var position=0
+        var position=if(suffix=="traité") player?.currentPosition ?: 0 else 0
         var current=""
         fun listen(processed:Boolean) {
             val name=if(processed) "processed" else "original"
@@ -550,7 +582,7 @@ class MainActivity : Activity() {
         var keep=false
         val dialog=android.app.AlertDialog.Builder(this).setTitle("Préécoute").setView(panel).setNegativeButton("Annuler",null).setPositiveButton("Enregistrer une copie") { _,_ ->
             keep=true; val app=applicationContext
-            Thread({ val result=runCatching { VoiceFileProcessor.saveCopy(app,temp,file.name) }; temp.delete(); runOnUiThread { if(!isFinishing && !isDestroyed) { Toast.makeText(this,if(result.isSuccess) "Version traitée enregistrée" else "Échec de la sauvegarde",Toast.LENGTH_LONG).show(); if(result.isSuccess) showFiles() } } },"voice-copy").start()
+            Thread({ val result=runCatching { VoiceFileProcessor.saveCopy(app,temp,file.name,suffix) }; temp.delete(); runOnUiThread { if(!isFinishing && !isDestroyed) { Toast.makeText(this,if(result.isSuccess) "Version traitée enregistrée" else "Échec de la sauvegarde",Toast.LENGTH_LONG).show(); if(result.isSuccess) showFiles() } } },"voice-copy").start()
         }.create()
         dialog.setOnDismissListener { preview?.release(); preview=null; if(!keep) temp.delete() }; dialog.show()
     }
@@ -559,8 +591,8 @@ class MainActivity : Activity() {
         profileText?.text = if(state=="idle") VoiceProfile.labels.getOrElse(prefs.getInt("voice_profile",0)) { "Original" } else RecorderService.activeProfileLabel
         startButton?.isEnabled=state!="saving"
         status?.text = when (state) {
-            "recording" -> "Enregistrement en cours"
-            "paused" -> "En pause"
+            "recording" -> "Enregistrement en cours" + if(RecorderService.liveMarkers.isEmpty()) "" else " · ${RecorderService.liveMarkers.size} marqueur(s)"
+            "paused" -> "En pause" + if(RecorderService.liveMarkers.isEmpty()) "" else " · ${RecorderService.liveMarkers.size} marqueur(s)"
             "connecting" -> "Connexion Bluetooth…"
             "saving" -> "Sauvegarde…"
             else -> "Prêt à enregistrer"
@@ -569,6 +601,9 @@ class MainActivity : Activity() {
         routeText?.text = if(state=="idle") "" else RecorderService.routeLabel
         showGlyph(startButton,if(state=="idle") "●" else "■")
         startButton?.contentDescription = if(state=="idle") "Démarrer l’enregistrement" else "Arrêter et sauvegarder"
+        liveMarkerButton?.isEnabled=state=="recording" || state=="paused"
+        liveMarkerButton?.contentDescription="Ajouter un marqueur (${if(state=="idle") 0 else RecorderService.liveMarkers.size})"
+        liveMarkerButton?.alpha=if(liveMarkerButton?.isEnabled==true) 1f else .35f
         pauseButton?.isEnabled = state == "recording" || state == "paused"
         pauseButton?.alpha=if(pauseButton?.isEnabled==true) 1f else .35f
         showGlyph(pauseButton,if (state == "paused") "▶" else "Ⅱ")
@@ -613,13 +648,12 @@ class MainActivity : Activity() {
         if(files.isEmpty()) return
         if(files.any { it.key==activeFile }) releasePlayer()
         val permanent = trashMode && !restore
-        android.app.AlertDialog.Builder(this).setTitle(if(restore) "Restaurer ?" else if(permanent) "Supprimer définitivement ?" else "Retirer les fichiers ?")
-            .setMessage(if(!restore && !permanent) "Corbeille sur Android 11 et ultérieur pour les fichiers partagés ; suppression définitive sinon." else "${files.size} fichier(s)")
-            .setNegativeButton("Annuler",null).setPositiveButton("Confirmer") { _,_ ->
-                val failures=files.count { f -> !runCatching { if(restore) f.trash(this,false) else if(!permanent && Build.VERSION.SDK_INT>=30 && f.uri!=null) f.trash(this,true) else f.delete(this) }.getOrDefault(false) }
-                if(failures>0) Toast.makeText(this,"$failures opération(s) impossible(s)",Toast.LENGTH_LONG).show()
-                selectionMode=false; selected.clear(); showFiles()
-            }.show()
+        fun applyAction() {
+            val failures=files.count { f -> !runCatching { if(permanent) f.delete(this) else f.trash(this,!restore) }.getOrDefault(false) }
+            Toast.makeText(this,if(failures>0) "$failures opération(s) impossible(s)" else if(restore) "Fichiers restaurés" else if(permanent) "Fichiers supprimés" else "Déplacé dans la corbeille",Toast.LENGTH_SHORT).show()
+            selectionMode=false; selected.clear(); showFiles()
+        }
+        if(permanent) android.app.AlertDialog.Builder(this).setTitle("Supprimer définitivement ?").setMessage("${files.size} fichier(s)").setNegativeButton("Annuler",null).setPositiveButton("Supprimer") { _,_ -> applyAction() }.show() else applyAction()
     }
     private fun showFiles() {
         uiHandler.removeCallbacks(meterTick); waveform=null
@@ -645,6 +679,7 @@ class MainActivity : Activity() {
             if(!trashMode && !selectionMode) row.addView(iconButton(if(activeFile==file.key && player?.isPlaying==true) "Ⅱ" else "▶","Lecture rapide") { val m=mediaFor(file); if(m!=null) { if(m.isPlaying) m.pause() else m.start(); showFiles() } },LinearLayout.LayoutParams(dp(48),dp(48)))
             if(selectionMode) row.addView(CheckBox(this).apply { isChecked=file.key in selected; setOnClickListener { toggle() } })
             else if(trashMode) row.addView(iconButton("↶","Restaurer") { fileAction(listOf(file),true) })
+            else row.addView(iconButton("⋮","Actions") { android.app.AlertDialog.Builder(this).setItems(arrayOf("Partager","Mettre à la corbeille")) { _,i -> if(i==0) shareFiles(listOf(file)) else fileAction(listOf(file)) }.show() },LinearLayout.LayoutParams(dp(44),dp(44)))
             root.addView(row)
             if(!trashMode && activeFile==file.key && !selectionMode) {
                 val m=player!!; val bar=SeekBar(this).apply { max=m.duration.coerceAtLeast(1); progress=m.currentPosition; setOnSeekBarChangeListener(object:SeekBar.OnSeekBarChangeListener { override fun onProgressChanged(b:SeekBar?,v:Int,user:Boolean){ if(user && player===m) m.seekTo(v) }; override fun onStartTrackingTouch(b:SeekBar?){}; override fun onStopTrackingTouch(b:SeekBar?){} }) }; root.addView(bar)
@@ -663,9 +698,9 @@ class MainActivity : Activity() {
     private fun showPlayer(file: AudioStorage.Recording) {
         page = "player"; screen(file.title)
         audioHeader(file.title,{showFiles()},"⋮","Actions") {
-            android.app.AlertDialog.Builder(this).setItems(arrayOf("Renommer","Partager","Supprimer","Améliorer l’audio")) { _,i -> when(i) {
+            android.app.AlertDialog.Builder(this).setItems(arrayOf("Renommer","Partager","Supprimer","Améliorer l’audio","Raccourcir")) { _,i -> when(i) {
                 0 -> { val input=field(file.title); android.app.AlertDialog.Builder(this).setTitle("Renommer").setView(input).setNegativeButton("Annuler",null).setPositiveButton("OK") { _,_ -> releasePlayer(); if(file.rename(this,input.text.toString().trim())) showFiles() }.show() }
-                1 -> shareFiles(listOf(file)); 2 -> fileAction(listOf(file)); 3 -> improveFile(file)
+                1 -> shareFiles(listOf(file)); 2 -> fileAction(listOf(file)); 3 -> improveFile(file); 4 -> trimFile(file)
             } }.show()
         }
         val media=mediaFor(file) ?: run { root.addView(text("Lecture impossible")); return }
@@ -683,12 +718,25 @@ class MainActivity : Activity() {
             override fun onStartTrackingTouch(bar: SeekBar?) {}
             override fun onStopTrackingTouch(bar: SeekBar?) {}
         }) }; root.addView(seek)
+        val markerList=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }; root.addView(markerList)
+        fun refreshMarkers() {
+            val marks=Markers.read(this,file.key); wave.markers(marks); markerList.removeAllViews()
+            if(marks.isNotEmpty()) markerList.addView(text("Marqueurs (${marks.size})",14f,true))
+            marks.forEachIndexed { index,ms ->
+                val row=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL }
+                row.addView(text(shortTime(ms.toLong()),13f).apply { setTextColor(accent); setOnClickListener { media.seekTo(ms.coerceIn(0,duration)) } },LinearLayout.LayoutParams(dp(62),-2))
+                row.addView(text(Markers.name(this,file.key,ms,"Marqueur ${index+1}"),15f).apply { setOnClickListener { media.seekTo(ms.coerceIn(0,duration)) }; setOnLongClickListener { val input=field(Markers.name(this@MainActivity,file.key,ms,"Marqueur ${index+1}")); android.app.AlertDialog.Builder(this@MainActivity).setTitle("Renommer le marqueur").setView(input).setNegativeButton("Annuler",null).setPositiveButton("OK") { _,_ -> Markers.rename(this@MainActivity,file.key,ms,input.text.toString().trim()); refreshMarkers() }.show(); true } },LinearLayout.LayoutParams(0,-2,1f))
+                row.addView(iconButton("×","Supprimer le marqueur") { Markers.remove(this,file.key,ms); refreshMarkers() },LinearLayout.LayoutParams(dp(44),dp(44)))
+                markerList.addView(row)
+            }
+        }
+        refreshMarkers()
         bottomSpace(); space(18)
         val play = primary("▶") { if (media.isPlaying) media.pause() else media.start() }
         val playbackRow=LinearLayout(this).apply { gravity=Gravity.CENTER }
         playbackRow.addView(labeledControl("↶ 10","−10 s") { media.seekTo((media.currentPosition-10000).coerceAtLeast(0)) },LinearLayout.LayoutParams(0,dp(64),1f))
         playbackRow.addView(play,LinearLayout.LayoutParams(dp(72),dp(72)))
-        playbackRow.addView(labeledControl("10 ↷","+10 s") { media.seekTo((media.currentPosition+10000).coerceAtMost(duration)) },LinearLayout.LayoutParams(0,dp(64),1f)); root.addView(playbackRow)
+        playbackRow.addView(labeledControl("10 ↷","+10 s") { media.seekTo((media.currentPosition+10000).coerceAtMost(duration)) },LinearLayout.LayoutParams(0,dp(64),1f)); screenFrame.addView(playbackRow,LinearLayout.LayoutParams(-1,dp(80)))
         val speeds = listOf(.5f, .75f, 1f, 1.25f, 1.5f, 2f)
         var speedIndex=speeds.indexOf(runCatching { media.playbackParams.speed }.getOrDefault(1f)).takeIf { it>=0 } ?: 2
         var speedGlyph:Button?=null
@@ -699,11 +747,8 @@ class MainActivity : Activity() {
         }
         speedGlyph=speedButton.getChildAt(0) as? Button
         showGlyph(speedGlyph,"×${speeds[speedIndex]}")
-        val markerKey="markers:${file.key}"
         space(16)
-        val markerAction={ val marks=prefs.getString(markerKey,"").orEmpty().split(',').mapNotNull { it.toIntOrNull() }; prefs.edit().putString(markerKey,(marks+media.currentPosition).distinct().sorted().joinToString(",")).apply(); Toast.makeText(this,"Marqueur ajouté",Toast.LENGTH_SHORT).show() }
-        val markerMenu={ android.app.AlertDialog.Builder(this).setTitle("Repères").setItems(arrayOf("Ajouter un repère","Liste des repères")) { _,i -> if(i==0) markerAction() else { val marks=prefs.getString(markerKey,"").orEmpty().split(',').mapNotNull { it.toIntOrNull() }; android.app.AlertDialog.Builder(this).setTitle("Marqueurs").setItems(marks.map { shortTime(it.toLong()) }.toTypedArray()) { _,j -> media.seekTo(marks[j]) }.setNegativeButton("Fermer",null).show() } }.show(); Unit }
-        controls(labeledControl("Repères","Repères",markerMenu),speedButton,labeledControl("Améliorer","Améliorer") { improveFile(file) },labeledControl("Partager","Partager") { shareFiles(listOf(file)) })
+        screenFrame.addView(controlRow(labeledControl("Marqueur","Marqueur") { Markers.write(this,file.key,Markers.read(this,file.key)+media.currentPosition); refreshMarkers() },speedButton,labeledControl("Raccourcir","Raccourcir") { trimFile(file) },labeledControl("Améliorer","Améliorer") { improveFile(file) },labeledControl("Partager","Partager") { shareFiles(listOf(file)) }),LinearLayout.LayoutParams(-1,-2))
         uiHandler.post(object : Runnable { override fun run() {
             if (player !== media || page != "player" || !wave.isAttachedToWindow) return
             showGlyph(play,if(media.isPlaying) "Ⅱ" else "▶"); play.contentDescription=if(media.isPlaying) "Pause" else "Lecture"; val current = media.currentPosition; time.text = formatTime(current.toLong()); seek.progress = current; wave.position(current); uiHandler.postDelayed(this, 40)
